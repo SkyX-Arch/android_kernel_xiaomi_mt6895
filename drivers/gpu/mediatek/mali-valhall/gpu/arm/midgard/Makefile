@@ -17,6 +17,12 @@
 # http://www.gnu.org/licenses/gpl-2.0.html.
 #
 #
+# Fallback for builds where CONFIG_MTK_PLATFORM is not yet defined
+# (e.g., make mrproper outside AOSP build environment).
+ifeq ($(CONFIG_MTK_PLATFORM),)
+CONFIG_MTK_PLATFORM := "mt6895"
+endif
+
 MTK_PLATFORM_VERSION := $(CONFIG_MTK_PLATFORM:"%"=%)
 
 ifeq ($(MTK_PLATFORM_VERSION),mt6789)
