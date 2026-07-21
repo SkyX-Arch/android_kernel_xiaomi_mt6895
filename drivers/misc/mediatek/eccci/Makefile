@@ -19,6 +19,15 @@ else
 CCCI_OBJ=n
 endif
 
+# Fallback for builds where MTK_PROJECT/MTK_PATH_CUSTOM are not yet defined
+# (e.g., make mrproper outside AOSP build environment).
+ifeq ($(MTK_PROJECT),)
+MTK_PROJECT := plato
+endif
+ifeq ($(MTK_PATH_CUSTOM),)
+MTK_PATH_CUSTOM := custom
+endif
+
 ifneq ($(CCCI_OBJ), n)
 
 ccflags-y += -I$(srctree)/drivers/misc/mediatek/eccci/inc/

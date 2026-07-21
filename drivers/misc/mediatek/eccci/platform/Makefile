@@ -11,6 +11,15 @@
 # See http://www.gnu.org/licenses/gpl-2.0.html for more details.
 #
 
+# Fallback for builds where MTK_PROJECT/MTK_PATH_CUSTOM are not yet defined
+# (e.g., make mrproper outside AOSP build environment).
+ifeq ($(MTK_PROJECT),)
+MTK_PROJECT := plato
+endif
+ifeq ($(MTK_PATH_CUSTOM),)
+MTK_PATH_CUSTOM := custom
+endif
+
 ifeq ($(CONFIG_MTK_ECCCI_DRIVER), y)
 
 ccflags-y += -I$(srctree)/

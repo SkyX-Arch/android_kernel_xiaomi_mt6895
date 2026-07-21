@@ -14,6 +14,12 @@ endif
 CONNSYS_PLATFORM := $(TARGET_BOARD_PLATFORM_WMT)
 PRIORITY_TABLE_MTK_PLATFORM := mt6735
 
+# Fallback for builds where ARCH_MTK_PROJECT is not yet defined
+# (e.g., make mrproper outside AOSP build environment).
+ifeq ($(ARCH_MTK_PROJECT),)
+ARCH_MTK_PROJECT := plato
+endif
+
 ifeq ($(CONNSYS_PLATFORM),)
 CONNSYS_PLATFORM := $(MTK_PLATFORM)
 else
