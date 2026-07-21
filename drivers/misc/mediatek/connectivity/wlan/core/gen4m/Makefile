@@ -4,6 +4,13 @@ CONFIG_MTK_PLATFORM := mt$(WLAN_CHIP_ID)
 endif
 MTK_PLATFORM := $(subst $(quote),,$(CONFIG_MTK_PLATFORM))
 
+# Fallback for builds where CONFIG_MTK_COMBO_WIFI_HIF is not yet defined
+# (e.g., make mrproper outside AOSP build environment).
+# MT6895 uses AXI HIF according to Android.mk.
+ifeq ($(CONFIG_MTK_COMBO_WIFI_HIF),)
+CONFIG_MTK_COMBO_WIFI_HIF := axi
+endif
+
 # ---------------------------------------------------
 # OS option
 # ---------------------------------------------------
