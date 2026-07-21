@@ -9,6 +9,10 @@ MTK_TOP = $(srctree)/drivers/misc/mediatek/
 CONFIG_MALI_MIDGARD := m
 
 # use mtk platform
+# Fallback for plain make mrproper where MTK_PLATFORM is unset.
+ifeq ($(MTK_PLATFORM),)
+MTK_PLATFORM := mt6895
+endif
 CONFIG_MALI_PLATFORM_NAME := $(MTK_PLATFORM)
 
 ccflags-y += -Wno-unused-variable
