@@ -1668,7 +1668,7 @@ out_putpage:
 	 * isolate_lru_page() or drop the page ref if it was
 	 * not isolated.
 	 */
-	put_user_page(page);
+	put_page(page);
 out:
 	mmap_read_unlock(mm);
 	return err;

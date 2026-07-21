@@ -14,7 +14,6 @@
 #include <linux/uidgid.h>
 #include <uapi/linux/android/binderfs.h>
 #include "binder_alloc.h"
-#include "dbitmap.h"
 
 struct binder_context {
 	struct binder_node *binder_context_mgr_node;
@@ -361,6 +360,12 @@ struct binder_priority {
 	int prio;
 };
 
+enum binder_prio_state {
+	BINDER_PRIO_SET,	/* desired priority set */
+	BINDER_PRIO_PENDING,	/* initiated a saved priority restore */
+	BINDER_PRIO_ABORT,	/* abort the pending priority restore */
+};
+
 /**
  * struct binder_proc - binder process bookkeeping
  * @proc_node:            element for binder_procs list
@@ -378,6 +383,9 @@ struct binder_priority {
  * @pid                   PID of group_leader of process
  *                        (invariant after initialized)
  * @tsk                   task_struct for group_leader of process
+ *                        (invariant after initialized)
+ * @cred                  struct cred associated with the `struct file`
+ *                        in binder_open()
  *                        (invariant after initialized)
  * @deferred_work_node:   element for binder_deferred_list
  *                        (protected by binder_deferred_lock)
@@ -441,6 +449,7 @@ struct binder_proc {
 	struct list_head waiting_threads;
 	int pid;
 	struct task_struct *tsk;
+	const struct cred *cred;
 	struct hlist_node deferred_work_node;
 	int deferred_work;
 	int outstanding_txns;
@@ -449,6 +458,7 @@ struct binder_proc {
 	bool sync_recv;
 	bool async_recv;
 	wait_queue_head_t freeze_wait;
+
 	struct list_head todo;
 	struct binder_stats stats;
 	struct list_head delivered_death;
@@ -467,29 +477,23 @@ struct binder_proc {
 };
 
 /**
- * struct binder_proc_ext - extended binder_proc struct
- * @proc:            element for binder_procs list
- * @cred                  struct cred associated with the `struct file`
- *                        in binder_open()
- *                        (invariant after initialized)
- * @delivered_freeze:     list of delivered freeze notification
- *                        (protected by @inner_lock)
- * @lock:            protects binder_alloc fields
- * @dmap             dbitmap to manage available reference descriptors
- *                   (protected by @proc.outer_lock)
- *
- * Extended binder_proc -- needed to add the "cred" and "lock" field
- * without changing the KMI for binder_proc.
- * Extended binder_proc -- needed to add the "dmap" field without
- * changing the KMI for binder_proc.
+ * struct binder_proc_wrap - wrapper to preserve KMI in binder_proc
+ * @proc:                    binder_proc being wrapped
+ * @lock:                    protects @proc->alloc fields
+ * @delivered_freeze:        list of delivered freeze notification
+ *                           (protected by @inner_lock)
  */
-struct binder_proc_ext {
+struct binder_proc_wrap {
 	struct binder_proc proc;
-	const struct cred *cred;
-	struct list_head delivered_freeze;
 	spinlock_t lock;
-	struct dbitmap dmap;
+	struct list_head delivered_freeze;
 };
+
+static inline
+struct binder_proc_wrap *proc_wrapper(struct binder_proc *proc)
+{
+	return container_of(proc, struct binder_proc_wrap, proc);
+}
 
 static inline struct binder_proc *
 binder_proc_entry(struct binder_alloc *alloc)
@@ -497,41 +501,30 @@ binder_proc_entry(struct binder_alloc *alloc)
 	return container_of(alloc, struct binder_proc, alloc);
 }
 
-static inline struct binder_proc_ext *
-binder_proc_ext_entry(struct binder_proc *proc)
+static inline struct binder_proc_wrap *
+binder_alloc_to_proc_wrap(struct binder_alloc *alloc)
 {
-	return container_of(proc, struct binder_proc_ext, proc);
-}
-
-static inline struct binder_proc_ext *
-binder_alloc_to_proc_ext(struct binder_alloc *alloc)
-{
-	return binder_proc_ext_entry(binder_proc_entry(alloc));
+	return proc_wrapper(binder_proc_entry(alloc));
 }
 
 static inline void binder_alloc_lock_init(struct binder_alloc *alloc)
 {
-	spin_lock_init(&binder_alloc_to_proc_ext(alloc)->lock);
+	spin_lock_init(&binder_alloc_to_proc_wrap(alloc)->lock);
 }
 
 static inline void binder_alloc_lock(struct binder_alloc *alloc)
 {
-	spin_lock(&binder_alloc_to_proc_ext(alloc)->lock);
+	spin_lock(&binder_alloc_to_proc_wrap(alloc)->lock);
 }
 
 static inline void binder_alloc_unlock(struct binder_alloc *alloc)
 {
-	spin_unlock(&binder_alloc_to_proc_ext(alloc)->lock);
+	spin_unlock(&binder_alloc_to_proc_wrap(alloc)->lock);
 }
 
 static inline int binder_alloc_trylock(struct binder_alloc *alloc)
 {
-	return spin_trylock(&binder_alloc_to_proc_ext(alloc)->lock);
-}
-
-static inline const struct cred *binder_get_cred(struct binder_proc *proc)
-{
-	return binder_proc_ext_entry(proc)->cred;
+	return spin_trylock(&binder_alloc_to_proc_wrap(alloc)->lock);
 }
 
 /**
@@ -549,12 +542,6 @@ binder_alloc_get_free_async_space(struct binder_alloc *alloc)
 	free_async_space = alloc->free_async_space;
 	binder_alloc_unlock(alloc);
 	return free_async_space;
-}
-
-static inline
-struct binder_proc_ext *proc_wrapper(struct binder_proc *proc)
-{
-	return container_of(proc, struct binder_proc_ext, proc);
 }
 
 /**
@@ -591,6 +578,12 @@ struct binder_proc_ext *proc_wrapper(struct binder_proc *proc)
  *                        when outstanding transactions are cleaned up
  *                        (protected by @proc->inner_lock)
  * @task:                 struct task_struct for this thread
+ * @prio_lock:            protects thread priority fields
+ * @prio_next:            saved priority to be restored next
+ *                        (protected by @prio_lock)
+ * @prio_state:           state of the priority restore process as
+ *                        defined by enum binder_prio_state
+ *                        (protected by @prio_lock)
  *
  * Bookkeeping structure for binder threads.
  */
@@ -611,6 +604,9 @@ struct binder_thread {
 	atomic_t tmp_ref;
 	bool is_dead;
 	struct task_struct *task;
+	spinlock_t prio_lock;
+	struct binder_priority prio_next;
+	enum binder_prio_state prio_state;
 };
 
 /**
@@ -647,6 +643,7 @@ struct binder_transaction {
 	struct binder_priority	priority;
 	struct binder_priority	saved_priority;
 	bool    set_priority_called;
+	bool    is_nested;
 	kuid_t	sender_euid;
 	struct list_head fd_fixups;
 	binder_uintptr_t security_ctx;

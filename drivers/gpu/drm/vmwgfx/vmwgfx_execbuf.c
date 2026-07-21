@@ -4248,6 +4248,7 @@ int vmw_execbuf_process(struct drm_file *file_priv,
 			put_unused_fd(out_fence_fd);
 		} else {
 			struct seqno_waiter_rm_context *ctx;
+
 			/* Link the fence with the FD created earlier */
 			fd_install(out_fence_fd, sync_file->file);
 			ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);

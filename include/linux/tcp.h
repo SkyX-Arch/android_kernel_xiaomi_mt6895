@@ -226,9 +226,7 @@ struct tcp_sock {
 	u8	compressed_ack;
 	u8	dup_ack_counter:2,
 		tlp_retrans:1,	/* TLP is a retransmission */
-		fast_ack_mode:2, /* which fast ack mode ? */
-		tlp_orig_data_app_limited:1, /* app-limited before TLP rtx? */
-		unused:2;
+		unused:5;
 	u32	chrono_start;	/* Start time in jiffies of a TCP chrono */
 	u32	chrono_stat[3];	/* Time in jiffies for chrono_stat stats */
 	u8	chrono_type:2,	/* current chronograph type */
@@ -268,14 +266,12 @@ struct tcp_sock {
 	u32	packets_out;	/* Packets which are "in flight"	*/
 	u32	retrans_out;	/* Retransmitted packets out		*/
 	u32	max_packets_out;  /* max packets_out in last window */
-/* GENKSYMS hack to preserve the ABI because of f4ce91ce12a7 ("tcp: fix
- * tcp_cwnd_validate() to not forget is_cwnd_limited")
- */
-#ifndef __GENKSYMS__
-	u32	cwnd_usage_seq;  /* right edge of cwnd usage tracking flight */
-#else
-	u32	max_packets_seq;  /* right edge of max_packets_out flight */
-#endif
+	/* ANDROID:
+	 * max_packets_seq is really cwnd_usage_seq upstream, old name kept
+	 * to preserve ABI due to changes in commit 49d429760df7 ("tcp: fix
+	 * tcp_cwnd_validate() to not forget is_cwnd_limited")
+	 */
+	u32	max_packets_seq; /* right edge of cwnd usage tracking flight */
 
 	u16	urg_data;	/* Saved octet of OOB data and control flags */
 	u8	ecn_flags;	/* ECN status bits.			*/
@@ -397,7 +393,6 @@ struct tcp_sock {
 		u32		  probe_seq_start;
 		u32		  probe_seq_end;
 	} mtu_probe;
-	u32     plb_rehash;     /* PLB-triggered rehash attempts */
 	u32	mtu_info; /* We received an ICMP_FRAG_NEEDED / ICMPV6_PKT_TOOBIG
 			   * while socket was owned by user.
 			   */

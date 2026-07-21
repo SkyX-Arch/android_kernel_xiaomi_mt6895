@@ -425,7 +425,6 @@ void do_ptrauth_fault(struct pt_regs *regs, unsigned int esr)
 	 * Unexpected FPAC exception or pointer authentication failure in
 	 * the kernel: kill the task before it does any more harm.
 	 */
-	trace_android_rvh_do_ptrauth_fault(regs, esr, user_mode(regs));
 	BUG_ON(!user_mode(regs));
 	force_signal_inject(SIGILL, ILL_ILLOPN, regs->pc, esr);
 }
@@ -824,7 +823,6 @@ asmlinkage void noinstr handle_bad_stack(struct pt_regs *regs)
 	 * We use nmi_panic to limit the potential for recusive overflows, and
 	 * to get a better stack trace.
 	 */
-	trace_android_rvh_handle_bad_stack(regs, esr, far);
 	nmi_panic(NULL, "kernel stack overflow");
 	cpu_park_loop();
 }

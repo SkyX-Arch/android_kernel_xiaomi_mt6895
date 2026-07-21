@@ -669,7 +669,7 @@ static void ucsi_handle_connector_change(struct work_struct *work)
 	struct ucsi *ucsi = con->ucsi;
 	struct ucsi_connector_status pre_ack_status;
 	struct ucsi_connector_status post_ack_status;
-	enum typec_role role;
+	enum typec_role role, prev_role;
 	enum usb_role u_role = USB_ROLE_NONE;
 	u16 inferred_changes;
 	u16 changed_flags;
@@ -705,6 +705,8 @@ static void ucsi_handle_connector_change(struct work_struct *work)
 	 * We may end up seeing a change twice, but we can only miss extremely
 	 * short transitional changes.
 	 */
+
+	prev_role = !!(con->status.flags & UCSI_CONSTAT_PWR_DIR);
 
 	/* 1. First UCSI_GET_CONNECTOR_STATUS */
 	command = UCSI_GET_CONNECTOR_STATUS | UCSI_CONNECTOR_NUMBER(con->num);
@@ -783,8 +785,15 @@ static void ucsi_handle_connector_change(struct work_struct *work)
 		ucsi_port_psy_changed(con);
 	}
 
-	if (con->status.change & UCSI_CONSTAT_POWER_DIR_CHANGE) {
+	if ((con->status.change & UCSI_CONSTAT_POWER_DIR_CHANGE) &&
+	    role != prev_role) {
 		typec_set_pwr_role(con->port, role);
+
+		/* Some power_supply properties vary depending on the power direction when
+		 * connected
+		 */
+		if (con->status.flags & UCSI_CONSTAT_CONNECTED)
+			ucsi_port_psy_changed(con);
 
 		/* Complete pending power role swap */
 		if (!completion_done(&con->complete))
@@ -1100,15 +1109,6 @@ static int ucsi_register_port(struct ucsi *ucsi, int index)
 	con->num = index + 1;
 	con->ucsi = ucsi;
 
-	cap->fwnode = ucsi_find_fwnode(con);
-	con->usb_role_sw = fwnode_usb_role_switch_get(cap->fwnode);
-	if (IS_ERR(con->usb_role_sw)) {
-		dev_err(ucsi->dev, "con%d: failed to get usb role switch\n",
-			con->num);
-		return PTR_ERR(con->usb_role_sw);
-	}
-
-
 	/* Delay other interactions with the con until registration is complete */
 	mutex_lock(&con->lock);
 
@@ -1144,6 +1144,7 @@ static int ucsi_register_port(struct ucsi *ucsi, int index)
 	if (con->cap.op_mode & UCSI_CONCAP_OPMODE_DEBUG_ACCESSORY)
 		*accessory = TYPEC_ACCESSORY_DEBUG;
 
+	cap->fwnode = ucsi_find_fwnode(con);
 	cap->driver_data = con;
 	cap->ops = &ucsi_ops;
 
@@ -1199,6 +1200,13 @@ static int ucsi_register_port(struct ucsi *ucsi, int index)
 		ucsi_pwr_opmode_change(con);
 		ucsi_register_partner(con);
 		ucsi_port_psy_changed(con);
+	}
+
+	con->usb_role_sw = fwnode_usb_role_switch_get(cap->fwnode);
+	if (IS_ERR(con->usb_role_sw)) {
+		dev_err(ucsi->dev, "con%d: failed to get usb role switch\n",
+			con->num);
+		con->usb_role_sw = NULL;
 	}
 
 	/* Only notify USB controller if partner supports USB data */
@@ -1330,21 +1338,12 @@ err:
 
 static void ucsi_init_work(struct work_struct *work)
 {
-	struct ucsi_android *aucsi = container_of(work,
-				    struct ucsi_android, work.work);
+	struct ucsi *ucsi = container_of(work, struct ucsi, work);
 	int ret;
 
-	ret = ucsi_init(&aucsi->ucsi);
+	ret = ucsi_init(ucsi);
 	if (ret)
-		dev_err(aucsi->ucsi.dev, "PPM init failed (%d)\n", ret);
-
-	if (ret == -EPROBE_DEFER) {
-		if (aucsi->work_count++ > UCSI_ROLE_SWITCH_WAIT_COUNT)
-			return;
-
-		queue_delayed_work(system_long_wq, &aucsi->work,
-				   UCSI_ROLE_SWITCH_INTERVAL);
-	}
+		dev_err(ucsi->dev, "PPM init failed (%d)\n", ret);
 }
 
 /**
@@ -1376,17 +1375,15 @@ EXPORT_SYMBOL_GPL(ucsi_set_drvdata);
 struct ucsi *ucsi_create(struct device *dev, const struct ucsi_operations *ops)
 {
 	struct ucsi *ucsi;
-	struct ucsi_android *aucsi;
 
 	if (!ops || !ops->read || !ops->sync_write || !ops->async_write)
 		return ERR_PTR(-EINVAL);
 
-	aucsi = kzalloc(sizeof(*aucsi), GFP_KERNEL);
-	if (!aucsi)
+	ucsi = kzalloc(sizeof(*ucsi), GFP_KERNEL);
+	if (!ucsi)
 		return ERR_PTR(-ENOMEM);
 
-	ucsi = &aucsi->ucsi;
-	INIT_DELAYED_WORK(&aucsi->work, ucsi_init_work);
+	INIT_WORK(&ucsi->work, ucsi_init_work);
 	mutex_init(&ucsi->ppm_lock);
 	ucsi->dev = dev;
 	ucsi->ops = ops;
@@ -1401,9 +1398,7 @@ EXPORT_SYMBOL_GPL(ucsi_create);
  */
 void ucsi_destroy(struct ucsi *ucsi)
 {
-	struct ucsi_android *aucsi = container_of(ucsi,
-				    struct ucsi_android, ucsi);
-	kfree(aucsi);
+	kfree(ucsi);
 }
 EXPORT_SYMBOL_GPL(ucsi_destroy);
 
@@ -1413,8 +1408,6 @@ EXPORT_SYMBOL_GPL(ucsi_destroy);
  */
 int ucsi_register(struct ucsi *ucsi)
 {
-	struct ucsi_android *aucsi = container_of(ucsi,
-				    struct ucsi_android, ucsi);
 	int ret;
 
 	ret = ucsi->ops->read(ucsi, UCSI_VERSION, &ucsi->version,
@@ -1425,7 +1418,7 @@ int ucsi_register(struct ucsi *ucsi)
 	if (!ucsi->version)
 		return -ENODEV;
 
-	queue_delayed_work(system_long_wq, &aucsi->work, 0);
+	queue_work(system_long_wq, &ucsi->work);
 
 	return 0;
 }
@@ -1439,13 +1432,11 @@ EXPORT_SYMBOL_GPL(ucsi_register);
  */
 void ucsi_unregister(struct ucsi *ucsi)
 {
-	struct ucsi_android *aucsi = container_of(ucsi,
-				    struct ucsi_android, ucsi);
 	u64 cmd = UCSI_SET_NOTIFICATION_ENABLE;
 	int i;
 
 	/* Make sure that we are not in the middle of driver initialization */
-	cancel_delayed_work_sync(&aucsi->work);
+	cancel_work_sync(&ucsi->work);
 
 	/* Disable notifications */
 	ucsi->ops->async_write(ucsi, UCSI_CONTROL, &cmd, sizeof(cmd));

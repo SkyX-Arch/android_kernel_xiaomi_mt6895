@@ -245,26 +245,6 @@ struct sock_common {
 	/* public: */
 };
 
-struct sk_security_struct {
- #ifdef CONFIG_NETLABEL
- 	enum {				/* NetLabel state */
- 		NLBL_UNSET = 0,
- 		NLBL_REQUIRE,
- 		NLBL_LABELED,
- 		NLBL_REQSKB,
- 		NLBL_CONNLABELED,
- 	} nlbl_state;
- 	struct netlbl_lsm_secattr *nlbl_secattr; /* NetLabel sec attributes */
- #endif
- 	u32 sid;			/* SID of this object */
- 	u32 peer_sid;			/* SID of peer */
- 	u16 sclass;			/* sock security class */
- 	enum {				/* SCTP association state */
- 		SCTP_ASSOC_UNSET = 0,
- 		SCTP_ASSOC_SET,
- 	} sctp_assoc_state;
- };
-
 struct bpf_local_storage;
 
 /**
@@ -500,11 +480,7 @@ struct sock {
 	u32			sk_ack_backlog;
 	u32			sk_max_ack_backlog;
 	kuid_t			sk_uid;
-#if IS_ENABLED(CONFIG_DEBUG_SPINLOCK) || IS_ENABLED(CONFIG_DEBUG_LOCK_ALLOC)
 	spinlock_t		sk_peer_lock;
-#else
-	/* sk_peer_lock is in the ANDROID_KABI_RESERVE(1) field below */
-#endif
 	struct pid		*sk_peer_pid;
 	const struct cred	*sk_peer_cred;
 
@@ -526,7 +502,7 @@ struct sock {
 	struct socket		*sk_socket;
 	void			*sk_user_data;
 #ifdef CONFIG_SECURITY
-	struct sk_security_struct	sk_security[1];
+	void			*sk_security;
 #endif
 	struct sock_cgroup_data	sk_cgrp_data;
 	struct mem_cgroup	*sk_memcg;
@@ -552,11 +528,7 @@ struct sock {
 	struct module		*sk_owner;
 #endif
 
-#if IS_ENABLED(CONFIG_DEBUG_SPINLOCK) || IS_ENABLED(CONFIG_DEBUG_LOCK_ALLOC)
 	ANDROID_KABI_RESERVE(1);
-#else
-	ANDROID_KABI_USE(1, spinlock_t sk_peer_lock);
-#endif
 	ANDROID_KABI_RESERVE(2);
 	ANDROID_KABI_RESERVE(3);
 	ANDROID_KABI_RESERVE(4);
@@ -1310,7 +1282,7 @@ struct proto {
 	unsigned int		useroffset;	/* Usercopy region offset */
 	unsigned int		usersize;	/* Usercopy region size */
 
-	struct percpu_counter	*orphan_count;
+	unsigned int __percpu	*orphan_count;
 
 	struct request_sock_ops	*rsk_prot;
 	struct timewait_sock_ops *twsk_prot;
@@ -1814,6 +1786,7 @@ struct sk_buff *sock_omalloc(struct sock *sk, unsigned long size,
 			     gfp_t priority);
 void skb_orphan_partial(struct sk_buff *skb);
 void sock_rfree(struct sk_buff *skb);
+void sock_rmem_free(struct sk_buff *skb);
 void sock_efree(struct sk_buff *skb);
 #ifdef CONFIG_INET
 void sock_edemux(struct sk_buff *skb);
