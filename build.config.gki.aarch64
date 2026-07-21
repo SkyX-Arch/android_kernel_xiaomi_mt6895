@@ -26,6 +26,8 @@ android/abi_gki_aarch64_rockchip
 android/abi_gki_aarch64_rtkstb
 android/abi_gki_aarch64_telechips
 android/abi_gki_aarch64_tuxera
+android/abi_gki_aarch64_mtk
+android/abi_gki_aarch64_xiaomi
 "
 
 FILES="${FILES}
