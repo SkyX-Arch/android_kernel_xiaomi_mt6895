@@ -13,6 +13,8 @@ struct vm_struct;
 struct task_struct;
 
 #include <linux/kasan-enabled.h>
+#include <linux/kasan-checks.h>
+#include <linux/kasan-tags.h>
 
 #ifdef CONFIG_KASAN
 
