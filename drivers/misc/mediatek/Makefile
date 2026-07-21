@@ -1,4 +1,11 @@
 # SPDX-License-Identifier: GPL-2.0
+
+# Fallback for builds where CONFIG_MTK_PLATFORM is not yet defined
+# (e.g., make mrproper outside AOSP build environment).
+ifeq ($(CONFIG_MTK_PLATFORM),)
+CONFIG_MTK_PLATFORM := "mt6895"
+endif
+
 export MTK_PLATFORM := $(subst ",,$(CONFIG_MTK_PLATFORM))
 obj-$(CONFIG_MTK_BLOCK_IO_TRACER) += blocktag/
 obj-$(CONFIG_MTK_SLBC) += slbc/

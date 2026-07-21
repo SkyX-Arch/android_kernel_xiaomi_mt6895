@@ -16,6 +16,9 @@ $(warning GPS_CHIP_ID = common)
 else
 $(warning GPS_CHIP_ID != common)
 # Necessary Check
+ifeq ($(CONFIG_MTK_PLATFORM),)
+CONFIG_MTK_PLATFORM := "mt6895"
+endif
 MTK_PLATFORM := $(subst ",,$(CONFIG_MTK_PLATFORM))
 ifeq ($(CONFIG_MTK_GPS_SUPPORT), y)
 
