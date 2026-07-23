@@ -252,6 +252,7 @@ snd-soc-wcd9335-objs := wcd-clsh-v2.o wcd9335.o
 snd-soc-wcd934x-objs := wcd-clsh-v2.o wcd934x.o
 snd-soc-wl1273-objs := wl1273.o
 #snd-soc-wm-adsp-objs := wm_adsp.o
+snd-soc-wm-adsp-objs := wm_adsp.o
 snd-soc-wm0010-objs := wm0010.o
 snd-soc-wm1250-ev1-objs := wm1250-ev1.o
 snd-soc-wm2000-objs := wm2000.o
