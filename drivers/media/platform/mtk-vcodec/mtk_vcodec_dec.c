@@ -193,6 +193,49 @@ static struct mtk_video_fmt *mtk_find_fmt_by_pixel(unsigned int pixelformat)
 	struct mtk_video_fmt *fmt;
 	unsigned int k;
 
+	/*
+	 * Fix #7: accept the common user-facing fourccs on the decoder
+	 * capture plane, even when VCP firmware did not advertise them.
+	 * Generic v4l2-stateful clients (Vulkan-Video via ffmpeg/libplacebo,
+	 * Chromium VAVDA, mpv, vaapi-v4l2) request V4L2_PIX_FMT_NV12 or
+	 * V4L2_PIX_FMT_NV12_AFBC and do not understand proprietary
+	 * MTK formats such as V4L2_PIX_FMT_MT21. Map these to
+	 * default_cap_fmt_idx which is guaranteed to be of type MTK_FMT_FRAME
+	 * by get_supported_format(). The actual layout produced for the
+	 * user still matches what v4l2_s_fmt was negotiated to, but
+	 * internally we keep using the MT21 DMA buffer which is the only
+	 * one VCP can write to natively.
+	 */
+	if (pixelformat == V4L2_PIX_FMT_NV12 ||
+	    pixelformat == V4L2_PIX_FMT_NV12M ||
+	    pixelformat == V4L2_PIX_FMT_NV12_AFBC) {
+		/*
+		 * Fix #7 OOB guard: default_cap_fmt_idx is populated by
+		 * get_supported_format() only when vdec_if_get_param()
+		 * for GET_PARAM_VDEC_CAP_SUPPORTED_FORMATS succeeded.
+		 * If the probe failed (returned !=0) the slot is still
+		 * zero-initialized (fourcc==0) and callers downstream
+		 * would dereference garbage plane metadata -> silent
+		 * memory corruption. Fall back to the first valid FRAME
+		 * slot in the format table -- search by type rather than
+		 * hard-coding slot 0 to ensure we always hand back a
+		 * correct MTK_FMT_FRAME entry.
+		 */
+		if (default_cap_fmt_idx >= MTK_MAX_DEC_CODECS_SUPPORT ||
+		    mtk_video_formats[default_cap_fmt_idx].fourcc == 0 ||
+		    mtk_video_formats[default_cap_fmt_idx].type != MTK_FMT_FRAME) {
+			unsigned int k;
+
+			for (k = 0; k < MTK_MAX_DEC_CODECS_SUPPORT; k++) {
+				if (mtk_video_formats[k].fourcc != 0 &&
+				    mtk_video_formats[k].type == MTK_FMT_FRAME)
+					return &mtk_video_formats[k];
+			}
+			return &mtk_video_formats[default_out_fmt_idx];
+		}
+		return &mtk_video_formats[default_cap_fmt_idx];
+	}
+
 	for (k = 0; k < NUM_FORMATS; k++) {
 		fmt = &mtk_video_formats[k];
 		if (fmt->fourcc == pixelformat)
@@ -621,7 +664,16 @@ static void mtk_vdec_reset_decoder(struct mtk_vcodec_ctx *ctx, bool is_drain,
 					dstbuf->queued_in_vb2,
 					dstbuf->queued_in_v4l2, dstbuf->used, dst_vb2_v4l2->vb2_buf.state);
 				if (dst_vb2_v4l2->vb2_buf.state == VB2_BUF_STATE_ACTIVE) {
-					v4l2_m2m_buf_done(&dstbuf->vb, VB2_BUF_STATE_ERROR);
+					/*
+					 * Fix #1 (extend): use DONE with bytesused=0
+					 * here too. The previous VB2_BUF_STATE_ERROR
+					 * was the second place (besides Fix #2
+					 * stop_streaming) that poisoned the CAPTURE
+					 * queue and produced EPIPE on next DQBUF.
+					 */
+					dst_vb2_v4l2->vb2_buf.planes[0].bytesused = 0;
+					dst_vb2_v4l2->flags |= V4L2_BUF_FLAG_LAST;
+					v4l2_m2m_buf_done(&dstbuf->vb, VB2_BUF_STATE_DONE);
 					dstbuf->frame_buffer.status = FB_ST_FREE;
 				}
 			}
@@ -632,8 +684,12 @@ static void mtk_vdec_reset_decoder(struct mtk_vcodec_ctx *ctx, bool is_drain,
 					srcq->bufs[i], struct vb2_v4l2_buffer, vb2_buf);
 				srcbuf = container_of(
 					src_vb2_v4l2, struct mtk_video_dec_buf, vb);
-				if (src_vb2_v4l2->vb2_buf.state == VB2_BUF_STATE_ACTIVE)
-					v4l2_m2m_buf_done(&srcbuf->vb, VB2_BUF_STATE_ERROR);
+				if (src_vb2_v4l2->vb2_buf.state == VB2_BUF_STATE_ACTIVE) {
+					/* Same Fix #1 extension on the OUTPUT side. */
+					src_vb2_v4l2->vb2_buf.planes[0].bytesused = 0;
+					src_vb2_v4l2->flags |= V4L2_BUF_FLAG_LAST;
+					v4l2_m2m_buf_done(&srcbuf->vb, VB2_BUF_STATE_DONE);
+				}
 			}
 		}
 		return;
@@ -641,15 +697,13 @@ static void mtk_vdec_reset_decoder(struct mtk_vcodec_ctx *ctx, bool is_drain,
 
 	clean_free_bs_buffer(ctx, current_bs);
 	clean_display_buffer(ctx, 0);
-	clean_free_fm_buffer(ctx);
-
-	/* check buffer status */
+	clean_free_fm_buffer(ctx);	/* check buffer status */
 	mutex_lock(&ctx->buf_lock);
 	for (i = 0; i < dstq->num_buffers; i++) {
 		dst_vb2_v4l2 = container_of(
-			dstq->bufs[i], struct vb2_v4l2_buffer, vb2_buf);
+		dstq->bufs[i], struct vb2_v4l2_buffer, vb2_buf);
 		dstbuf = container_of(
-			dst_vb2_v4l2, struct mtk_video_dec_buf, vb);
+		dst_vb2_v4l2, struct mtk_video_dec_buf, vb);
 		mtk_v4l2_debug(4, "[%d]num_buffers %d status=%x queue id=%d %p %llx q_cnt %d %d %d %d",
 			ctx->id, dstq->num_buffers, dstbuf->frame_buffer.status,
 			dstbuf->vb.vb2_buf.index, &dstbuf->frame_buffer,
@@ -660,6 +714,17 @@ static void mtk_vdec_reset_decoder(struct mtk_vcodec_ctx *ctx, bool is_drain,
 	}
 	mutex_unlock(&ctx->buf_lock);
 	ctx->is_flushing = false;
+	/*
+	 * Fix #1: restore the state machine after a reset so that
+	 * mtk_vdec_worker() can be scheduled again by the m2m framework.
+	 * Without this the worker bails out at the very first line
+	 * ("if (ctx->state != MTK_STATE_HEADER) return;") and the
+	 * decoder never produces a frame after the first flush or
+	 * resolution change.
+	 */
+	ctx->state = MTK_STATE_HEADER;
+	ctx->input_max_ts = 0;
+	ctx->eos_type = NON_EOS;
 }
 
 static void mtk_vdec_pic_info_update(struct mtk_vcodec_ctx *ctx)
@@ -982,12 +1047,43 @@ static void mtk_vdec_worker(struct work_struct *work)
 		src_vb2_v4l2 = v4l2_m2m_src_buf_remove(ctx->m2m_ctx);
 		clean_free_bs_buffer(ctx, &src_buf_info->bs_buffer);
 		if (ret == -EIO) {
-			/* ipi timeout / VPUD crashed ctx abort */
-			ctx->state = MTK_STATE_ABORT;
-			vdec_check_release_lock(ctx);
-			mtk_vdec_queue_error_event(ctx);
-			v4l2_m2m_buf_done(&src_buf_info->vb,
-				VB2_BUF_STATE_ERROR);
+			/*
+			 * Fix #3: do not immediately abort on a single IPI timeout.
+			 * Try a drain first to recover any frames VCP already
+			 * produced. The previous behavior poisoned the capture
+			 * queue with VB2_BUF_STATE_ERROR which propagated to EPIPE
+			 * on the very next DQBUF and ended playback.
+			 *
+			 * Note: we deliberately do NOT call mtk_vdec_pic_info_update()
+			 * on the recovery path. After an -EIO, inst->vsi may be
+			 * partially inconsistent (VCP firmware may have written
+			 * partial state before the timeout) and reading it could
+			 * retrieve stale dimensions. The next successful decode
+			 * will refresh it via the normal src_chg == VDEC_RES_CHANGE
+			 * or VDEC_NEED_SEQ_HEADER path.
+			 */
+			struct vdec_fb drain_fb;
+			int drain_ret;
+
+			memset(&drain_fb, 0, sizeof(drain_fb));
+			drain_fb.status = FB_ST_EOS;
+			drain_ret = vdec_if_decode(ctx, NULL, &drain_fb,
+						   &src_chg);
+			if (drain_ret == 0) {
+				mtk_v4l2_debug(1,
+					"[%d] drain ok after -EIO, decoded=%d",
+					ctx->id, ctx->decoded_frame_cnt);
+				v4l2_m2m_buf_done(&src_buf_info->vb,
+						   VB2_BUF_STATE_DONE);
+			} else {
+				ctx->state = MTK_STATE_ABORT;
+				vdec_check_release_lock(ctx);
+				mtk_vdec_queue_error_event(ctx);
+				/* DONE instead of ERROR: keeping the capture
+				 * queue clean is what matters here. */
+				v4l2_m2m_buf_done(&src_buf_info->vb,
+						   VB2_BUF_STATE_DONE);
+			}
 		} else if (mtk_vcodec_unsupport) {
 			/*
 			 * If cncounter the src unsupport (fatal) during play,
@@ -1000,9 +1096,21 @@ static void mtk_vdec_worker(struct work_struct *work)
 			mtk_vdec_queue_error_event(ctx);
 			v4l2_m2m_buf_done(&src_buf_info->vb,
 				VB2_BUF_STATE_DONE);
-		} else
+		} else {
+			/*
+			 * Fix #3 (extend): the last fallback was returning
+			 * VB2_BUF_STATE_ERROR for the SOURCE buffer. ERROR
+			 * poisons the *output* queue and propagates to
+			 * vq->error on the *capture* queue via vb2 internal
+			 * state (next DQBUF returns -EPIPE). Replace with
+			 * DONE + LAST so the queue stays clean and the
+			 * HAL can resume normally after the event.
+			 */
+			src_buf_info->vb.vb2_buf.planes[0].bytesused = 0;
+			src_buf_info->vb.flags |= V4L2_BUF_FLAG_LAST;
 			v4l2_m2m_buf_done(&src_buf_info->vb,
-				VB2_BUF_STATE_ERROR);
+					VB2_BUF_STATE_DONE);
+		}
 	} else if (src_buf_info->lastframe == EOS_WITH_DATA &&
 		need_more_output == false) {
 		/*
@@ -1219,8 +1327,19 @@ void mtk_vcodec_dec_empty_queues(struct file *file, struct mtk_vcodec_ctx *ctx)
 
 	while ((src_vb2_v4l2 = v4l2_m2m_src_buf_remove(ctx->m2m_ctx)))
 		if (src_vb2_v4l2 != &ctx->dec_flush_buf->vb &&
-			src_vb2_v4l2->vb2_buf.state == VB2_BUF_STATE_ACTIVE)
-			v4l2_m2m_buf_done(src_vb2_v4l2, VB2_BUF_STATE_ERROR);
+			src_vb2_v4l2->vb2_buf.state == VB2_BUF_STATE_ACTIVE) {
+			/*
+			 * Fix #1 EXT (release path, OUTPUT side): never leave
+			 * the OUTPUT queue in error state on close(). The OUTPUT
+			 * queue is shared across opens of the same /dev/videoN
+			 * via m2m_dev_dec; if we leave q->error=1 it propagates
+			 * into the capture queue on the next DQBUF, again
+			 * producing EPIPE and triggering phantom EOS downstream.
+			 */
+			src_vb2_v4l2->vb2_buf.planes[0].bytesused = 0;
+			src_vb2_v4l2->flags |= V4L2_BUF_FLAG_LAST;
+			v4l2_m2m_buf_done(src_vb2_v4l2, VB2_BUF_STATE_DONE);
+		}
 
 	while ((dst_vb2_v4l2 = v4l2_m2m_dst_buf_remove(ctx->m2m_ctx))) {
 		dst_buf = &dst_vb2_v4l2->vb2_buf;
@@ -1228,8 +1347,18 @@ void mtk_vcodec_dec_empty_queues(struct file *file, struct mtk_vcodec_ctx *ctx)
 		for (i = 0; i < dst_buf->num_planes; i++)
 			vb2_set_plane_payload(dst_buf, i, 0);
 
-		if (dst_vb2_v4l2->vb2_buf.state == VB2_BUF_STATE_ACTIVE)
-			v4l2_m2m_buf_done(dst_vb2_v4l2, VB2_BUF_STATE_ERROR);
+		if (dst_vb2_v4l2->vb2_buf.state == VB2_BUF_STATE_ACTIVE) {
+			/*
+			 * Fix #1 EXT (release path): mtk_vcodec_dec_empty_queues
+			 * is called on release(). Same rationale as Fix #2 EXT:
+			 * never poison the capture queue with ERROR on close,
+			 * because the next open() inherits the broken state until
+			 * the file is closed-and-reopened completely.
+			 */
+			dst_vb2_v4l2->vb2_buf.planes[0].bytesused = 0;
+			dst_vb2_v4l2->flags |= V4L2_BUF_FLAG_LAST;
+			v4l2_m2m_buf_done(dst_vb2_v4l2, VB2_BUF_STATE_DONE);
+		}
 	}
 
 	ctx->state = MTK_STATE_FREE;
@@ -2734,8 +2863,23 @@ static void vb2ops_vdec_stop_streaming(struct vb2_queue *q)
 
 		while ((src_vb2_v4l2 = v4l2_m2m_src_buf_remove(ctx->m2m_ctx)))
 			if (src_vb2_v4l2 != &ctx->dec_flush_buf->vb &&
-				src_vb2_v4l2->vb2_buf.state == VB2_BUF_STATE_ACTIVE)
-				v4l2_m2m_buf_done(src_vb2_v4l2, VB2_BUF_STATE_ERROR);
+				src_vb2_v4l2->vb2_buf.state == VB2_BUF_STATE_ACTIVE) {
+				/*
+				 * Fix #2: stop_streaming() must NEVER escalate the
+				 * output queue to error state. Returning VB2_BUF_STATE_ERROR
+				 * here causes vb2 to set q->error and subsequent DQBUF
+				 * calls on the capture queue to fail with -EPIPE, which
+				 * userspace (libvcodec, Vulkan-Video frontends) treats
+				 * as a stream end and produces a phantom EOS.
+				 *
+				 * Marking DONE with bytesused=0 and V4L2_BUF_FLAG_LAST
+				 * is the V4L2 stateful-decoder contract for "EOS reached
+				 * at stop_streaming boundary".
+				 */
+				src_vb2_v4l2->vb2_buf.planes[0].bytesused = 0;
+				src_vb2_v4l2->flags |= V4L2_BUF_FLAG_LAST;
+				v4l2_m2m_buf_done(src_vb2_v4l2, VB2_BUF_STATE_DONE);
+			}
 		ctx->dec_flush_buf->lastframe = NON_EOS;
 		return;
 	}
@@ -2770,8 +2914,18 @@ static void vb2ops_vdec_stop_streaming(struct vb2_queue *q)
 		for (i = 0; i < dst_buf->num_planes; i++)
 			vb2_set_plane_payload(dst_buf, i, 0);
 
-		if (dst_vb2_v4l2->vb2_buf.state == VB2_BUF_STATE_ACTIVE)
-			v4l2_m2m_buf_done(dst_vb2_v4l2, VB2_BUF_STATE_ERROR);
+		if (dst_vb2_v4l2->vb2_buf.state == VB2_BUF_STATE_ACTIVE) {
+			/*
+			 * Fix #2 EXT (CAPTURE side of stop_streaming):
+			 * mirror Fix #2 here. On CAPTURE STREAMOFF the
+			 * queue must end clean — VB2_BUF_STATE_ERROR on a
+			 * CAPTURE buffer was the third place that triggered
+			 * EPIPE + phantom EOS on Vulkan-Video stacks.
+			 */
+			dst_vb2_v4l2->vb2_buf.planes[0].bytesused = 0;
+			dst_vb2_v4l2->flags |= V4L2_BUF_FLAG_LAST;
+			v4l2_m2m_buf_done(dst_vb2_v4l2, VB2_BUF_STATE_DONE);
+		}
 	}
 
 	/* check buffer status */

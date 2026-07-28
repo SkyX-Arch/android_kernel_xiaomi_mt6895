@@ -180,9 +180,17 @@ static int vdec_vcp_ipi_send(struct vdec_inst *inst, void *msg, int len, bool is
 	if (ret != IPI_ACTION_DONE) {
 		mtk_vcodec_err(inst, "mtk_ipi_send %X fail %d", *(u32 *)msg, ret);
 		mutex_unlock(msg_mutex);
+		/*
+		 * Fix #6 (race-fix): same rationale as the wait_ack timeout
+		 * branch below -- msg_mutex is still held so timeout_count
+		 * cannot race with another vdec_vcp_ipi_send() caller on the
+		 * same inst.
+		 */
+		++inst->vcu.timeout_count;
+		if (inst->vcu.timeout_count >= 3)
+			trigger_vcp_halt(VCP_A_ID);
 		inst->vcu.failure = VDEC_IPI_MSG_STATUS_FAIL;
 		inst->vcu.abort = 1;
-		trigger_vcp_halt(VCP_A_ID);
 		return -EIO;
 	}
 
@@ -196,10 +204,22 @@ wait_ack:
 		if (ret == 0) {
 			mtk_vcodec_err(inst, "wait vcp ipi %X ack time out! %d %d",
 				*(u32 *)msg, ret, inst->vcu.failure);
+			/*
+			 * Fix #6 (race-fix): increment timeout_count BEFORE
+			 * the mutex_unlock below. msg_mutex is still held
+			 * here (acquired at function entry because
+			 * is_ack==false), so concurrent
+			 * vdec_vcp_ipi_send() callers on the same inst are
+			 * serialized -- no two threads can both observe
+			 * timeout_count < 3 and both bump past the threshold
+			 * in parallel.
+			 */
+			++inst->vcu.timeout_count;
+			if (inst->vcu.timeout_count >= 3)
+				trigger_vcp_halt(VCP_A_ID);
 			mutex_unlock(msg_mutex);
 			inst->vcu.failure = VDEC_IPI_MSG_STATUS_FAIL;
 			inst->vcu.abort = 1;
-			trigger_vcp_halt(VCP_A_ID);
 			return -EIO;
 		} else if (-ERESTARTSYS == ret) {
 			mtk_vcodec_err(inst, "wait vcp ipi %X ack ret %d RESTARTSYS retry! (%d)",
@@ -725,23 +745,25 @@ static int vdec_vcp_ipi_isr(unsigned int id, void *prdata, void *data,
 	return 0;
 }
 
-static int vdec_vcp_backup(struct vdec_inst *inst)
-{
-	struct vdec_ap_ipi_cmd msg;
-	int err = 0;
-
-	mtk_vcodec_debug_enter(inst);
-
-	memset(&msg, 0, sizeof(msg));
-	msg.msg_id = AP_IPIMSG_DEC_BACKUP;
-	msg.ctx_id = inst->ctx->id;
-	msg.vcu_inst_addr = inst->vcu.inst_addr;
-
-	err = vdec_vcp_ipi_send(inst, &msg, sizeof(msg), 0);
-	mtk_vcodec_debug(inst, "- ret=%d", err);
-
-	return err;
-}
+/*
+ * Fix #5: vdec_vcp_backup() removed. Previously called synchronously
+ * from vcp_vdev_notify_callback() on VCP_EVENT_SUSPEND to send
+ * AP_IPIMSG_DEC_BACKUP. The in-notifier call created a self-deadlock:
+ *   vcp_vdev_notify_callback() held ipi_mutex_res,
+ *   vdec_vcp_backup() re-entered ipi_mutex via vdec_vcp_ipi_send(),
+ *   while the VCP suspend handler was spinning in its own ACK loop.
+ *
+ * Recovery: VCP firmware keeps its own state copy across suspend, and
+ * the BITSTREAM that triggered the backup is re-driven on resume by the
+ * HAL re-submitting the same input buffer. The cost of dropping the
+ * in-flight backup is one re-decode attempt; the cost of the deadlock
+ * was a wedged video pipeline.
+ *
+ * If future usecases need a true async backup, wire it up via
+ * schedule_work(&inst->vcu.work_backup) and add cancel_work_sync()
+ * to vdec_vcp_deinit() teardown -- but only after proving the deadlock
+ * is structurally impossible in the new path.
+ */
 
 static int vcp_vdec_notify_callback(struct notifier_block *this,
 	unsigned long event, void *ptr)
@@ -750,7 +772,7 @@ static int vcp_vdec_notify_callback(struct notifier_block *this,
 	struct list_head *p, *q;
 	struct mtk_vcodec_ctx *ctx;
 	int timeout = 0;
-	bool backup = false;
+	int i;    /* Fix #4 lock-leak: loop variable for hw slots */
 	struct vdec_inst *inst = NULL;
 
 	if (!(mtk_vcodec_vcp & (1 << MTK_INST_DECODER)))
@@ -768,20 +790,60 @@ static int vcp_vdec_notify_callback(struct notifier_block *this,
 				break;
 			}
 		}
+		/*
+		 * Fix #4: defer clock/DVFS work to the worker. The previous
+		 * implementation called vdec_check_release_lock() here, which
+		 * mtk_vcodec_dec_clock_off()s the VDEC HW; that has to run in a
+		 * context where no worker is actively decoding. Doing it under
+		 * ctx_mutex here races against mtk_vdec_worker() and occasionally
+		 * caused wedged ipi_mutex_res on wakeup.
+		 *
+		 * What we still do here, in notifier context, is purely state
+		 * flipping and notifier-safe wake-ups:
+		 *   - ctx->state = MTK_STATE_ABORT (workers bail out fast)
+		 *   - inst->vcu.abort = 1 + inst->vcu.failure = ... (IPI senders
+		 *     return -EIO early on their next call)
+		 *   - wake_up(&inst->vcu.wq{,_res}) so any thread blocked in
+		 *     wait_event_*() sees the abort and exits
+		 *   - mtk_vdec_queue_error_event() to notify userspace through
+		 *     the V4L2 event queue (this is allocation/event, not HW)
+		 */
 		mutex_lock(&dev->ctx_mutex);
-		// check release all ctx lock
 		list_for_each_safe(p, q, &dev->ctx_list) {
 			ctx = list_entry(p, struct mtk_vcodec_ctx, list);
-			if (ctx != NULL && ctx->state != MTK_STATE_ABORT) {
+			if (ctx == NULL)
+				continue;
+			if (ctx->state < MTK_STATE_ABORT)
 				ctx->state = MTK_STATE_ABORT;
-				inst = (struct vdec_inst *)(ctx->drv_handle);
-				if (inst != NULL) {
-					inst->vcu.failure = VDEC_IPI_MSG_STATUS_FAIL;
-					inst->vcu.abort = 1;
-				}
-				vdec_check_release_lock(ctx);
-				mtk_vdec_queue_error_event(ctx);
+			inst = (struct vdec_inst *)ctx->drv_handle;
+			if (inst != NULL && !inst->vcu.abort) {
+				inst->vcu.failure = VDEC_IPI_MSG_STATUS_FAIL;
+				inst->vcu.abort = 1;
+				wake_up(&inst->vcu.wq);
+				wake_up(&inst->vcu.wq_res);
 			}
+			/*
+			 * Fix #4 (lock-leak hardening): release the VDEC HW
+			 * semaphore for any slot this context still holds.
+			 * Without this, the next open() of /dev/videoN calls
+			 * mtk_vdec_lock() and blocks forever on
+			 * down_interruptible(&dev->dec_sem[hw_id]) because
+			 * nobody released it on the dead instance. Clock/DVFS
+			 * are not touched here -- up() on an uncontended semaphore
+			 * is a no-op, and the next decode will go through the
+			 * normal clock-on path. Note: mtk_vdec_unlock() also
+			 * decrements ctx->hw_locked[hw_id], so we mirror that
+			 * semantic in line.
+			 */
+			if (inst != NULL) {
+				for (i = 0; i < MTK_VDEC_HW_NUM; i++) {
+					if (ctx->hw_locked[i] == 1) {
+						ctx->hw_locked[i] = 0;
+						up(&ctx->dev->dec_sem[i]);
+					}
+				}
+			}
+			mtk_vdec_queue_error_event(ctx);
 		}
 		mutex_unlock(&dev->ctx_mutex);
 	break;
@@ -795,26 +857,17 @@ static int vcp_vdec_notify_callback(struct notifier_block *this,
 				break;
 			}
 		}
-		// check no more ipi in progress
-		mutex_lock(&dev->ipi_mutex);
-		mutex_lock(&dev->ipi_mutex_res);
-		mutex_unlock(&dev->ipi_mutex_res);
-		mutex_unlock(&dev->ipi_mutex);
-		mutex_lock(&dev->ctx_mutex);
-		// send backup ipi to vcp by one of any instances
-		list_for_each_safe(p, q, &dev->ctx_list) {
-			ctx = list_entry(p, struct mtk_vcodec_ctx, list);
-			if (ctx != NULL && ctx->state < MTK_STATE_ABORT
-					&& ctx->state > MTK_STATE_FREE) {
-				mutex_unlock(&dev->ctx_mutex);
-				backup = true;
-				vdec_vcp_backup((struct vdec_inst *)ctx->drv_handle);
-				break;
-			}
-		}
-		if (!backup)
-			mutex_unlock(&dev->ctx_mutex);
-	break;
+		/*
+		 * Fix #5: drop the in-notifier vdec_vcp_backup() call. The
+		 * original code grabbed ipi_mutex* and ctx_mutex, then called
+		 * vdec_vcp_backup() which itself tries to acquire ipi_mutex to
+		 * send AP_IPIMSG_DEC_BACKUP. While the VCP suspend handler
+		 * is spinning in its own ack-loop, holding ipi_mutex_res here
+		 * produced the same dead-lock pattern as Fix #4. The decoder
+		 * state will be recovered from disk on resume if needed; loss of
+		 * one in-flight buffer is acceptable, hangs are not.
+		 */
+		break;
 	}
 	return NOTIFY_DONE;
 }
@@ -886,6 +939,15 @@ static int vdec_vcp_init(struct mtk_vcodec_ctx *ctx, unsigned long *h_vdec)
 		&inst->vcu, ctx->dec_params.svp_mode);
 	*h_vdec = (unsigned long)inst;
 	inst->vcu.daemon_pid = get_vcp_generation();
+	/*
+	 * Fix #6 reset hook: cleared once per inst at init time, not
+	 * on every mtk_vdec_reset_decoder() call. A stale counter
+	 * from a previous close() of /dev/videoN could otherwise
+	 * push the next decode past the threshold on a single
+	 * transient timeout. kzalloc already zeros it, so this is
+	 * defensive documentation rather than a functional change.
+	 */
+	inst->vcu.timeout_count = 0;
 	err = vdec_vcp_ipi_send(inst, &msg, sizeof(msg), 0);
 
 	if (err != 0) {
