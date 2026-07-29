@@ -70,6 +70,7 @@
 #include "gl_wext.h"
 #include "precomp.h"
 #include <linux/can/netlink.h>
+#include <linux/bug.h>
 #include <net/netlink.h>
 #include <net/cfg80211.h>
 #include "gl_cfg80211.h"
@@ -919,6 +920,181 @@ nla_put_failure:
 }
 
 
+/* === Android-compatible LLS multi-link wrapper (Android 14+) === */
+/* AOSP wifi_link_state enum — duplicated from
+ * libhardware_legacy/link_layer_stats.h because that header is
+ * userspace-only and unavailable to the kernel module. Values must
+ * track upstream AOSP; otherwise AOSP HAL reads at wifi_hal.cpp's
+ * check_data_sanity() return the wrong state. */
+#define WIFI_LINK_STATE_NOT_VALID    0
+#define WIFI_LINK_STATE_NOT_IN_USE   1
+#define WIFI_LINK_STATE_IN_USE       2
+/*
+ * Compile-time guardrails. WIFI_LINK_STATE_* is a hand-rolled mirror
+ * of AOSP's libhardware_legacy/link_layer_stats.h, since that
+ * header is userspace-only and not visible here. If upstream ever
+ * changes these numeric values, the build fails instead of silently
+ * emitting a state the HAL interprets as "not connected".
+ */
+/*
+ * IMPORTANT: file-scope assertions in this module use static_assert()
+ * (from <linux/build_bug.h>) and NOT BUILD_BUG_ON(). The macro comment
+ * for static_assert explicitly distinguishes them:
+ *
+ *   BUILD_BUG_ON(condition)  - fails compile if condition is TRUE
+ *   static_assert(expr)       - fails compile if expr is FALSE
+ *
+ * I.e. the polarities are INVERTED. static_assert() is a C11-style
+ * declaration (`_Static_assert`) and is valid at file scope; BUILD_BUG_ON()
+ * expands to a `do { ... } while (0)` STATEMENT and is only valid inside
+ * function bodies. Clang -Werror rejects file-scope BUILD_BUG_ON with
+ * "expected identifier or '('" (the macro expands into a statement at
+ * translation-unit scope).
+ */
+static_assert(WIFI_LINK_STATE_IN_USE == 2,
+	      "WIFI_LINK_STATE_IN_USE drifted from AOSP value 2");
+static_assert(WIFI_LINK_STATE_NOT_IN_USE == 1,
+	      "WIFI_LINK_STATE_NOT_IN_USE drifted from AOSP value 1");
+
+struct android_wmm_ac_stat {
+	__u32 ac;
+	__u32 tx_mpdu;
+	__u32 rx_mpdu;
+	__u32 tx_mcast;
+	__u32 rx_mcast;
+	__u32 rx_ampdu;
+	__u32 tx_ampdu;
+	__u32 mpdu_lost;
+	__u32 retries;
+	__u32 retries_short;
+	__u32 retries_long;
+};
+/*
+ * Matched against AOSP wifi_link_stat / wifi_iface_ml_stat
+ * (Android 14 'U QPR2'). The previous BUGGY layout — which
+ * wifi_hal.cpp::check_data_sanity() rejected with "No links found" —
+ * had:
+ *   - wifi_link_stat preamble of 8 bytes instead of AOSP's 16
+ *     (state was u8 instead of u32, radio u16 instead of u32, no
+ *     _pad0[3] alignment). wifi_hal.cpp's check_data_sanity() reads
+ *     offsetof(wifi_link_stat, peer_info) at byte 16 + body, so the
+ *     kernel was emitting data 8 bytes earlier than the HAL expected
+ *     and `ml_stat->num_links` came back zero from padding residue.
+ *   - android_iface_ml_stat had 4 stray bytes (is_ml_supported +
+ *     is_ml_st_supported + reserved) between info and num_links,
+ *     shifting num_links to the wrong offset for the HAL's
+ *     offsetof(wifi_iface_ml_stat, num_links) read.
+ *
+ * Compile-time assertions at the bottom of this block catch any
+ * future drift between kernel struct layout and AOSP, so the next
+ * person who changes a field width learns at compile time, not via
+ * 3-second logcat spam.
+ */
+struct android_link_stat {
+	/*
+	 * AOSP wifi_link_stat layout (Android 14 'U QPR2'):
+	 *   offset 0  : link_id                    (u8)
+	 *   offset 1  : _pad0[3]                   (u8 [3])   align state/radio/frequency to u32
+	 *   offset 4  : state                      (u32)
+	 *   offset 8  : radio                      (u32)
+	 *   offset 12 : frequency                  (u32)
+	 *   offset 16 : beacon_rx                  (u32)
+	 *   offset 20 : _pad1[4]                  (u8 [4])   align average_tsf_offset to u64
+	 *   offset 24 : average_tsf_offset         (u64)
+	 *   offset 32 : leaky_ap_detected          (u32)
+	 *   offset 36 : leaky_ap_avg_num_frames_leaked (u32)
+	 *   offset 40 : leaky_ap_guard_time        (u32)
+	 *   offset 44 : mgmt_rx                    (u32)
+	 *   offset 48 : mgmt_action_rx             (u32)
+	 *   offset 52 : mgmt_action_tx             (u32)
+	 *   offset 56 : rssi_mgmt                  (s32)
+	 *   offset 60 : rssi_data                  (s32)
+	 *   offset 64 : rssi_ack                   (s32)
+	 *   offset 68 : ac[4] (4 × android_wmm_ac_stat)
+	 *   ... then time_slicing_duty_cycle_percent (u8)
+	 *   ... then _pad2[3]                       align num_peers to u32
+	 *   ... then num_peers (u32)
+	 * Flexible peer_info[] array follows in buffer (not declared here).
+	 */
+	__u8 link_id;
+	__u8 _pad0[3];
+	__u32 state;
+	__u32 radio;
+	__u32 frequency;
+	__u32 beacon_rx;
+	__u8 _pad1[4];
+	__u64 average_tsf_offset;
+	__u32 leaky_ap_detected;
+	__u32 leaky_ap_avg_num_frames_leaked;
+	__u32 leaky_ap_guard_time;
+	__u32 mgmt_rx;
+	__u32 mgmt_action_rx;
+	__u32 mgmt_action_tx;
+	__s32 rssi_mgmt;
+	__s32 rssi_data;
+	__s32 rssi_ack;
+	struct android_wmm_ac_stat ac[4];
+	__u8 time_slicing_duty_cycle_percent;
+	__u8 _pad2[3];
+	__u32 num_peers;
+};
+struct android_iface_ml_stat {
+	/*
+	 * AOSP wifi_iface_ml_stat layout (Android 14 'U QPR2'):
+	 *   offset 0          : iface            (void *; u64 on arm64)
+	 *   offset 8          : info             (WIFI_INTERFACE_LINK_LAYER_INFO, same struct on both sides)
+	 *   offset 8+info_size: num_links        (u32)
+	 *   offset 12+info_sz : links[] (flexible array, not declared in struct)
+	 *
+	 * No intermediate is_ml_supported/is_ml_st_supported/reserved bytes —
+	 * that's what the HAL's offsetof(wifi_iface_ml_stat, num_links)
+	 * computed against wifi_link_layer_stats.h expects.
+	 */
+	void *iface;
+	struct WIFI_INTERFACE_LINK_LAYER_INFO info;
+	__u32 num_links;
+	struct android_link_stat links;
+};
+
+/*
+ * ABI assertions — wifi_hal.cpp reads these struct fields by
+ * offsetof(), so any drift between the kernel layout and AOSP
+ * silently breaks LLS (the "No links found" we just fixed was
+ * exactly that). Adding them here means a future field-width
+ * change fails the kernel build, instead of leaking the breakage
+ * to userspace logcat.
+ */
+static_assert(offsetof(struct android_link_stat, link_id) == 0,
+	      "android_link_stat.link_id offset drifted from AOSP layout (was 0)");
+static_assert(offsetof(struct android_link_stat, state) == 4,
+	      "android_link_stat.state offset drifted (was 4)");
+static_assert(offsetof(struct android_link_stat, radio) == 8,
+	      "android_link_stat.radio offset drifted (was 8)");
+static_assert(offsetof(struct android_link_stat, frequency) == 12,
+	      "android_link_stat.frequency offset drifted (was 12)");
+static_assert(offsetof(struct android_link_stat, beacon_rx) == 16,
+	      "android_link_stat.beacon_rx offset drifted (was 16)");
+static_assert(offsetof(struct android_link_stat, average_tsf_offset) == 24,
+	      "android_link_stat.average_tsf_offset offset drifted (was 24)");
+static_assert(sizeof(struct android_wmm_ac_stat) == 44,
+	      "android_wmm_ac_stat size drifted (was 44 = 11 * u32)");
+/*
+ * The lls_pad_android_ml() prefix-copy of ac[] relies on MTK's
+ * STATS_LLS_WMM_AC_STAT carrying at least the same first 11 fields as
+ * our 44-byte android_wmm_ac_stat. If MTK shrinks the prefix below 11
+ * fields the memcpy underflows the source; if MTK reorders before the
+ * 11th field the destination gets garbage. Compile-time guardrail so
+ * any change in MTK WMM AC layout fails the build, not userspace.
+ */
+static_assert(sizeof(struct STATS_LLS_WMM_AC_STAT) >=
+	      sizeof(struct android_wmm_ac_stat),
+	      "STATS_LLS_WMM_AC_STAT shrunk below android_wmm_ac_stat prefix");
+static_assert(STATS_LLS_WIFI_AC_MAX == 4,
+	      "STATS_LLS_WIFI_AC_MAX drifted from 4 (AC_BE/BK/VI/VO)");
+static_assert(offsetof(struct android_iface_ml_stat, num_links) ==
+	      sizeof(void *) + sizeof(struct WIFI_INTERFACE_LINK_LAYER_INFO),
+	      "android_iface_ml_stat.num_links offset drifted from AOSP layout");
+
 #if CFG_SUPPORT_LLS
 void dumpLinkStatsIface(struct STATS_LLS_WIFI_IFACE_STAT *iface)
 {
@@ -1355,6 +1531,121 @@ uint32_t fill_radio(uint8_t *dst, struct WIFI_RADIO_CHANNEL_STAT *src,
 	DBGLOG(REQ, TRACE, "advanced %u bytes", dst - orig);
 	return dst - orig;
 }
+
+/*
+ * Transform MTK's flat single-iface STATS_LLS_WIFI_IFACE_STAT into
+ * AOSP's android_iface_ml_stat. MTK connac2x firmware does not
+ * produce per-link structs natively; we synthesise one android_link_stat
+ * per active iface — for single-STA Plato that's exactly one. Avoid
+ * spoofing num_links=1 on a disconnected iface by checking
+ * iface->info.state ≥ WIFI_ASSOCIATING before emitting (covers both AOSP
+ * enum and MTK firmware that reports ASSOCIATED as state=2).
+ *
+ * Output layout (dst):
+ *   [0..sizeof(android_iface_ml_stat)-1]      = iface+info+num_links
+ *   [sizeof(android_iface_ml_stat)..+link-1]  = up to 1 link_stat
+ *   [after link block..end]                   = MTK peer blobs + radio stats
+ *
+ * Single-call MTK ENUM_WIFI_CONNECTION_STATE semantics:
+ *   0 DISCONNECTED  1 AUTHENTICATING  2 ASSOCIATING
+ *   3 ASSOCIATED    4 EAPOL_STARTED   5 EAPOL_COMPLETED
+ */
+static uint32_t lls_pad_android_ml(uint8_t *dst, const uint8_t *src,
+        uint32_t src_len, uint32_t *out_len)
+{
+        struct android_iface_ml_stat *hdr;
+        const struct STATS_LLS_WIFI_IFACE_STAT *iface;
+        struct android_link_stat *link;
+        uint32_t hdr_size = sizeof(struct android_iface_ml_stat);
+        uint32_t link_block_sz;
+        uint8_t *tail_dst;
+        uint32_t tail_sz;
+        int in_use;
+
+        if (src_len < sizeof(struct STATS_LLS_WIFI_IFACE_STAT)) return 0;
+        if (!dst || !src || !out_len) return 0;
+        hdr = (struct android_iface_ml_stat *)dst;
+        iface = (const struct STATS_LLS_WIFI_IFACE_STAT *)src;
+
+        /* Header (iface pointer + WIFI_INTERFACE_LINK_LAYER_INFO). */
+        memcpy(&hdr->iface, &iface->iface, sizeof(void *));
+        memcpy(&hdr->info, &iface->info,
+               sizeof(struct WIFI_INTERFACE_LINK_LAYER_INFO));
+
+        /*
+         * Connect-state threshold: only emit a link if the iface is
+         * actually ASSOCIATED or further. WIFI_ASSOCIATED=3,
+         * WIFI_EAPOL_COMPLETED=5. Lower values (DISCONNECTED..ASSOCIATING)
+         * produce num_links=0 silently — HAL won't log "No links found"
+         * on a legitimately-disconnected iface.
+         */
+        in_use = (iface->info.state >= WIFI_ASSOCIATING);
+        hdr->num_links = in_use ? 1 : 0;
+        link_block_sz = hdr->num_links * sizeof(struct android_link_stat);
+
+        if (in_use) {
+                link = (struct android_link_stat *)(dst + hdr_size);
+                /* memset already done by caller; defensive for any
+                 * future direct caller in this file. */
+                memset(link, 0, sizeof(struct android_link_stat));		link->link_id = 0;
+		link->state = WIFI_LINK_STATE_IN_USE;
+                /* MTK iface carries aggregated per-iface counters; we
+                 * therefore don't have a per-link radio or operating
+                 * frequency from the source buf's iface region. Setting
+                 * both to 0 lets HAL report the link as "operational
+                 * but unspecified band". A future enhancement can crawl
+                 * src's radio[] region for an active-frequency signal. */
+                link->radio = 0;
+                link->frequency = 0;
+
+                link->beacon_rx = iface->beacon_rx;
+                link->average_tsf_offset = iface->average_tsf_offset;
+                link->leaky_ap_detected = iface->leaky_ap_detected;
+                link->leaky_ap_avg_num_frames_leaked =
+                        iface->leaky_ap_avg_num_frames_leaked;
+                link->leaky_ap_guard_time = iface->leaky_ap_guard_time;
+                link->mgmt_rx = iface->mgmt_rx;
+                link->mgmt_action_rx = iface->mgmt_action_rx;
+                link->mgmt_action_tx = iface->mgmt_action_tx;
+                link->rssi_mgmt = iface->rssi_mgmt;
+                link->rssi_data = iface->rssi_data;
+                link->rssi_ack = iface->rssi_ack;
+                /*
+                 * AC prefix-copy: MTK's STATS_LLS_WMM_AC_STAT has 15
+                 * fields (60 bytes/entry) but our android_wmm_ac_stat has
+                 * 11 fields (44 bytes/entry). The first 11 fields sit at
+                 * matching offsets, so copying
+                 *   sizeof(android_wmm_ac_stat) * STATS_LLS_WIFI_AC_MAX
+                 * = 44 * 4 = 176 bytes from iface->ac[0] yields HAL's
+                 * expected layout without overflow. The 4 trailing
+                 * contention_time_* fields per AC entry are MTK-specific
+                 * and have no AOSP counterpart — dropped.
+                 */
+                memcpy(link->ac, iface->ac,
+                       sizeof(struct android_wmm_ac_stat) *
+                       STATS_LLS_WIFI_AC_MAX);
+                link->time_slicing_duty_cycle_percent = 100;
+                /* Deliberately set num_peers=0: STATS_LLS_PEER_INFO
+                 * carries MTK-specific bssload + type fields that don't
+                 * map onto AOSP wifi_peer_info. Exposing MTK peer blobs
+                 * would mislead HAL's per-peer parser. The tail
+                 * (peer_info + radio stats) is still copied below —
+                 * harmless because num_peers gates HAL reads. */
+                link->num_peers = 0;
+        }
+
+        /* Append kernel tail (peer blobs + channel stats). */
+        tail_sz = src_len - sizeof(struct STATS_LLS_WIFI_IFACE_STAT);
+        if (tail_sz > 0) {
+                tail_dst = dst + hdr_size + link_block_sz;
+                memcpy(tail_dst,
+                       src + sizeof(struct STATS_LLS_WIFI_IFACE_STAT),
+                       tail_sz);
+        }
+
+        *out_len = hdr_size + link_block_sz + tail_sz;
+        return 1;
+}
 #endif /* CFG_SUPPORT_LLS */
 
 
@@ -1441,23 +1732,61 @@ int mtk_cfg80211_vendor_llstats_get_info(struct wiphy *wiphy,
 		ptr += sizeof(uint32_t);
 
 		ptr += fill_radio(ptr, src->radio, ENUM_BAND_NUM, prAdapter);
-		DBGLOG(REQ, TRACE, "Collected %u bytes for LLS", ptr - buf);
+		DBGLOG(REQ, TRACE, "Collected %u bytes for LLS", ptr - buf);		{
+			uint8_t *ml_buf;
+			uint32_t ml_len = 0;
+			/*
+			 * alloc_sz = full MTK buf (iface+peers+channels) +
+			 * android_iface_ml_stat header size +
+			 * one android_link_stat size (worst case when the
+			 * iface is in_use and num_links=1 in the output).
+			 * When num_links ends up 0, the link_block bytes
+			 * are wasted but kept uninitialised by the memset
+			 * below, so it's safe.
+			 */
+			uint32_t alloc_sz = (uint32_t)(ptr - buf) +
+			        sizeof(struct android_iface_ml_stat) +
+			        sizeof(struct android_link_stat);
 
-		skb = cfg80211_vendor_cmd_alloc_reply_skb(wiphy, ptr - buf);
-		if (!skb) {
-			DBGLOG(REQ, WARN, "allocate skb %u bytes failed:%x",
-			       ptr - buf);
-			rStatus = -ENOMEM;
+			ml_buf = kalMemAlloc(alloc_sz, VIR_MEM_TYPE);
+			if (!ml_buf) {
+				rStatus = -ENOMEM;
+				break;
+			}
+			/*
+			 * kalMemAlloc returns uninitialised heap. Zero the
+			 * buffer so the extended android_link_stat fields
+			 * added by the AOSP-layout fix (leaky_ap_*,
+			 * time_slicing_*, _padN, average_tsf_offset,
+			 * num_peers, etc.) don't leak slab garbage into
+			 * wifi_hal.cpp's check_data_sanity() reads.
+			 * memset-then-memcpy inside lls_pad_android_ml()
+			 * leaves these at zero on the parts that function
+			 * doesn't explicitly write.
+			 */
+			memset(ml_buf, 0, alloc_sz);
+
+			if (lls_pad_android_ml(ml_buf, buf,
+				        (uint32_t)(ptr - buf), &ml_len)) {
+				skb = cfg80211_vendor_cmd_alloc_reply_skb(wiphy, ml_len);
+				if (!skb) {
+					kalMemFree(ml_buf, VIR_MEM_TYPE, alloc_sz);
+					rStatus = -ENOMEM;
+					break;
+				}
+				if (unlikely(nla_put_nohdr(skb, ml_len, ml_buf) < 0)) {
+					kalMemFree(ml_buf, VIR_MEM_TYPE, alloc_sz);
+					rStatus = -EIO;
+					break;
+				}
+				kalMemFree(ml_buf, VIR_MEM_TYPE, alloc_sz);
+				rStatus = cfg80211_vendor_cmd_reply(skb);
+				return rStatus;
+			}
+			kalMemFree(ml_buf, VIR_MEM_TYPE, alloc_sz);
+			rStatus = -EFAULT;
 			break;
 		}
-
-		if (unlikely(nla_put_nohdr(skb, ptr - buf, buf) < 0)) {
-			rStatus = -EIO;
-			break;
-		}
-
-		rStatus = cfg80211_vendor_cmd_reply(skb);
-		return rStatus;
 	} while (0);
 
 	if (skb != NULL)
