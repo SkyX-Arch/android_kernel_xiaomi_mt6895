@@ -174,8 +174,32 @@ static int vdec_vcp_ipi_send(struct vdec_inst *inst, void *msg, int len, bool is
 	ret = mtk_ipi_send(&vcp_ipidev, IPI_OUT_VDEC_1, IPI_SEND_WAIT, &obj,
 		ipi_size, IPI_TIMEOUT_MS);
 
-	if (is_ack)
+	if (is_ack) {
+		/*
+		 * Fix #6 (reset on success): clear the consecutive-failure
+		 * counter when an IPI returns cleanly. Without this, a
+		 * transient timeout in a previous session (e.g. across
+		 * open/close of /dev/videoN, or across vcp daemon restart)
+		 * leaves timeout_count > 0 and the very next transient
+		 * timeout in this session trips trigger_vcp_halt(), which
+		 * wedges the decoder for the lifetime of the new session.
+		 * is_ack IPIs do not wait for VCP ack, so by definition
+		 * any return here is "send-side success"; reset is safe.
+		 *
+		 * Concurrency note: is_ack IPIs do NOT acquire msg_mutex
+		 * (see `if (!is_ack) mutex_lock(msg_mutex)` below), so a
+		 * concurrent !is_ack caller on the same inst could be mid
+		 * increment under msg_mutex while we reset here. The
+		 * counter is a 3-strike heuristic, not an exact count, so
+		 * racing the reset against an in-flight increment is
+		 * acceptable: the failure that was being counted is
+		 * likely transient, and the next attempt will re-count
+		 * if it also fails. ARM64 aligned int read/write is
+		 * atomic, so no torn value.
+		 */
+		inst->vcu.timeout_count = 0;
 		return 0;
+	}
 
 	if (ret != IPI_ACTION_DONE) {
 		mtk_vcodec_err(inst, "mtk_ipi_send %X fail %d", *(u32 *)msg, ret);
@@ -229,6 +253,15 @@ wait_ack:
 			mtk_vcodec_err(inst, "wait vcp ipi %X ack fail ret %d! (%d)",
 				*(u32 *)msg, ret, inst->vcu.failure);
 		}
+		/*
+		 * Fix #6 (reset on success): on full !is_ack success
+		 * (mtk_ipi_send returned IPI_ACTION_DONE AND wait_ack
+		 * returned a non-zero jiffies remainder), clear the
+		 * consecutive-failure counter. msg_mutex is still held
+		 * here so no concurrent vdec_vcp_ipi_send() caller on
+		 * the same inst can race this write.
+		 */
+		inst->vcu.timeout_count = 0;
 	}
 	mutex_unlock(msg_mutex);
 
