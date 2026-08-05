@@ -37,6 +37,7 @@
 //#include <mt-plat/sync_write.h>
 //#include <mt-plat/aee.h>
 #include <linux/delay.h>
+#include <linux/errno.h>
 #include <aee.h>
 #include <soc/mediatek/smi.h>
 #include "vcp_feature_define.h"
@@ -1761,20 +1762,26 @@ void vcp_awake_init(void)
 	vcp_reset_awake_counts();
 }
 
-void vcp_wait_core_stop_timeout(int mmup_enable)
+int vcp_wait_core_stop_timeout(int mmup_enable)
 {
 	uint32_t core0_halt = 0;
 	uint32_t core1_halt = 0;
 	uint32_t val = 0;
+	bool halted = false;
 	/* make sure vcp is in idle state */
 	int timeout = 500; /* max wait 0.5s */
 
 	if (mmup_enable == 0) {
+		/*
+		 * MMUP is already powered off, so VCP cannot issue DMA. Treat
+		 * this as a completed stop; callers must not poll powered-down
+		 * status registers during suspend/remove.
+		 */
 		pr_notice("[VCP] power off, do not wait reset done\n");
-		return;
+		return 0;
 	}
 
-	while (timeout--) {
+	while (timeout-- > 0) {
 		val = readl(R_CORE0_STATUS);
 		core0_halt = (val == (B_CORE_GATED | B_HART0_HALT | B_HART1_HALT));
 		val = readl(R_CORE1_STATUS);
@@ -1787,16 +1794,21 @@ void vcp_wait_core_stop_timeout(int mmup_enable)
 			/* VCP stops any activities
 			 * and parks at wfi
 			 */
+			halted = true;
 			break;
 		}
 		mdelay(1);
 	}
 
-	if (timeout == 0)
+	if (!halted) {
 		pr_notice("[VCP] reset timeout, still reset vcp: 0x%x, 0x%x\n",
 			readl(R_CORE0_STATUS), readl(R_CORE1_STATUS));
+		return -ETIMEDOUT;
+	}
 
+	return 0;
 }
+EXPORT_SYMBOL_GPL(vcp_wait_core_stop_timeout);
 
 #if VCP_RECOVERY_SUPPORT
 /*
@@ -1937,6 +1949,7 @@ void vcp_send_reset_wq(enum VCP_RESET_TYPE type)
 		vcp_schedule_reset_work(&vcp_sys_reset_work);
 	}
 }
+EXPORT_SYMBOL_GPL(vcp_send_reset_wq);
 #endif
 
 int vcp_check_resource(void)

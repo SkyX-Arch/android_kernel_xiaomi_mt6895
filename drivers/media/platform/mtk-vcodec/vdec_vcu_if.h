@@ -38,7 +38,7 @@ struct vdec_vcu_inst {
 	struct platform_device *dev;
 	ipi_handler_t handler;
 	bool abort;
-	int timeout_count;    /* Fix #6: consecutive IPI failure counter */
+	atomic_t timeout_count; /* Fix #6: consecutive IPI failure counter */
 	int daemon_pid;
 	struct mutex *ctx_ipi_lock;
 	struct list_head bufs;
