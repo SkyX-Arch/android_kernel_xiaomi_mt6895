@@ -649,12 +649,44 @@ static int lcm_unprepare(struct drm_panel *panel)
 }
 
 
+struct lcm_videolfb_tag {
+	u64 fb_base;
+	u32 islcmfound;
+	u32 fps;
+	u32 vram;
+	char lcmname[1];
+};
+
+static bool lcm_is_init_from_lk(void)
+{
+	struct device_node *chosen_node;
+	struct lcm_videolfb_tag *videolfb_tag = NULL;
+	unsigned long size = 0;
+	bool ret = false;
+
+	chosen_node = of_find_node_by_path("/chosen");
+	if (chosen_node) {
+		videolfb_tag = (struct lcm_videolfb_tag *)of_get_property(
+			chosen_node, "atag,videolfb", (int *)&size);
+		if (videolfb_tag)
+			ret = videolfb_tag->islcmfound;
+	}
+	return ret;
+}
+
 static void lcm_panel_init(struct drm_panel *panel)
 {
 	struct lcm *ctx = panel_to_lcm(panel);
 	pr_info("%s: +\n", __func__);
 	if (ctx->prepared) {
 		pr_info("%s: panel has been prepared, nothing to do!\n", __func__);
+		goto err;
+	}
+
+	if (lcm_is_init_from_lk()) {
+		pr_info("%s: panel already initialized by LK, skip HW reset\n",
+			__func__);
+		ctx->prepared = true;
 		goto err;
 	}
 
