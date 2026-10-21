@@ -77,6 +77,15 @@
 #define NFC_SET_PWR			_IOW(NFC_MAGIC, 0x01, unsigned int)
 #define ESE_SET_PWR			_IOW(NFC_MAGIC, 0x02, unsigned int)
 #define ESE_GET_PWR			_IOR(NFC_MAGIC, 0x03, unsigned int)
+/*
+ * Introduced by the MW HAL (NFC_AR_00_7E800_15.0x and above).
+ * Without these two ioctls the HAL logs:
+ *   "UpdateReadPending: X ret = 0xffffffff"
+ * on every open/close of /dev/nq-nci because the kernel returns
+ * -ENOIOCTLCMD for an unknown command.
+ */
+#define NFC_SET_RESET_READ_PENDING	_IOW(NFC_MAGIC, 0x04, unsigned int)
+#define NFC_GET_GPIO_STATUS		_IOR(NFC_MAGIC, 0x05, unsigned int)
 
 #define DTS_IRQ_GPIO_STR		"qcom,nq-irq"
 #define DTS_VEN_GPIO_STR		"qcom,nq-ven"
@@ -98,6 +107,31 @@ enum nfcc_ioctl_request {
 	/* request for firmware download gpio LOW */
 	NFC_FW_DWL_LOW,
 };
+
+/*
+ * Read pending states, the values should be aligned with the MW HAL
+ * enum NfcReadPending (see NfccTransport.h).
+ * The HAL sets the flag right after opening the device and resets it
+ * during shutdown, so that a read blocked inside the driver can always
+ * be released.
+ */
+enum nfc_read_pending_state {
+	/* no read pending, release any blocked read */
+	MODE_NFC_RESET_READ_PENDING = 0x0,
+	/* read pending, wait for the NFCC interrupt */
+	MODE_NFC_SET_READ_PENDING,
+};
+
+/*
+ * GPIO status encoding returned by NFC_GET_GPIO_STATUS.
+ * Two bits per GPIO, as expected by the MW HAL platform_gpios_t layout:
+ * bit 1:0 -> IRQ, bit 3:2 -> VEN, bit 5:4 -> FIRMWARE/DWL request.
+ * Value 0 -> GPIO low, 1 -> GPIO high, 2 -> GPIO not available.
+ */
+#define NFC_GPIO_STATUS_INVALID		(0x2)
+#define NFC_GPIO_STATUS_IRQ_SHIFT	(0)
+#define NFC_GPIO_STATUS_VEN_SHIFT	(2)
+#define NFC_GPIO_STATUS_DWL_SHIFT	(4)
 
 /* nfc platform interface type */
 enum interface_flags {
@@ -178,6 +212,8 @@ struct nfc_dev {
 	/* NFC VEN pin state */
 	bool nfc_ven_enabled;
 	bool release_read;
+	/* set by the HAL through NFC_SET_RESET_READ_PENDING */
+	bool read_pending;
 	union {
 		struct i2c_dev i2c_dev;
 	};

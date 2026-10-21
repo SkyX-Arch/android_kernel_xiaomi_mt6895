@@ -20,6 +20,7 @@
 #include <linux/gpio.h>
 #include <linux/of_gpio.h>
 #include <linux/delay.h>
+#include <linux/uaccess.h>
 
 #include "common_ese.h"
 
@@ -289,6 +290,94 @@ static int nfc_ioctl_power_states(struct nfc_dev *nfc_dev, unsigned long arg)
 }
 
 /**
+ * nfc_ioctl_read_pending() - set or reset the read pending state
+ * @nfc_dev:    nfc device data structure
+ * @arg:        MODE_NFC_SET_READ_PENDING or MODE_NFC_RESET_READ_PENDING
+ *
+ * The MW HAL (15.0x) informs the driver whether a read is pending.
+ * While a read is pending the driver may block the reader thread until
+ * the NFCC raises the interrupt line. Once the HAL resets the flag (it
+ * does that in phTmlNfc_Shutdown(), before closing the device) every
+ * blocked read has to be released, otherwise the HAL reader thread
+ * cannot be joined.
+ *
+ * Return: 0 on success, -EINVAL for an unsupported argument.
+ */
+static int nfc_ioctl_read_pending(struct nfc_dev *nfc_dev, unsigned long arg)
+{
+	int ret = 0;
+
+	switch (arg) {
+	case MODE_NFC_SET_READ_PENDING:
+		nfc_dev->release_read = false;
+		nfc_dev->read_pending = true;
+		nfc_dev->nfc_enable_intr(nfc_dev);
+		break;
+	case MODE_NFC_RESET_READ_PENDING:
+		nfc_dev->read_pending = false;
+		/* release the reader thread blocked in read() */
+		nfc_dev->release_read = true;
+		nfc_dev->nfc_disable_intr(nfc_dev);
+		wake_up(&nfc_dev->read_wq);
+		break;
+	default:
+		pr_err("%s: bad arg %lu\n", __func__, arg);
+		ret = -EINVAL;
+		break;
+	}
+
+	return ret;
+}
+
+/**
+ * nfc_ioctl_get_gpio_status() - report the state of the NFCC GPIOs
+ * @nfc_dev:    nfc device data structure
+ * @arg:        user space pointer to a uint32_t status word
+ *
+ * The MW HAL uses this to log the level of the IRQ, VEN and firmware
+ * download pins (phNxpNciHal_decodeGpioStatus()). Two bits per GPIO,
+ * 2 means "not available".
+ *
+ * Return: 0 on success, -EFAULT if the status cannot be copied out.
+ */
+static int nfc_ioctl_get_gpio_status(struct nfc_dev *nfc_dev,
+				     unsigned long arg)
+{
+	struct platform_gpio *nfc_gpio = &nfc_dev->configs.gpio;
+	uint32_t gpio_status;
+	int irq, ven, dwl;
+
+	irq = get_valid_gpio(nfc_gpio->irq);
+	ven = get_valid_gpio(nfc_gpio->ven);
+	dwl = get_valid_gpio(nfc_gpio->dwl_req);
+
+	/*
+	 * get_valid_gpio() already returns the pin level, or -EINVAL when
+	 * the GPIO is not described in the device tree. Report the real
+	 * level, 2 means "pin not available".
+	 */
+	if (irq < 0)
+		irq = NFC_GPIO_STATUS_INVALID;
+	if (ven < 0)
+		ven = NFC_GPIO_STATUS_INVALID;
+	if (dwl < 0)
+		dwl = NFC_GPIO_STATUS_INVALID;
+
+	gpio_status = ((irq & 0x3) << NFC_GPIO_STATUS_IRQ_SHIFT) |
+		      ((ven & 0x3) << NFC_GPIO_STATUS_VEN_SHIFT) |
+		      ((dwl & 0x3) << NFC_GPIO_STATUS_DWL_SHIFT);
+
+	pr_debug("%s: status 0x%02x (irq %d ven %d dwl %d)\n", __func__,
+		 gpio_status, irq, ven, dwl);
+
+	if (copy_to_user((void __user *)arg, &gpio_status,
+			 sizeof(gpio_status)))
+		return -EFAULT;
+
+	return 0;
+}
+
+/**
  * nfc_dev_ioctl - used to set or get data from upper layer.
  * @pfile   file node for opened device.
  * @cmd     ioctl type from upper layer.
@@ -320,6 +409,12 @@ long nfc_dev_ioctl(struct file *pfile, unsigned int cmd, unsigned long arg)
 	case ESE_GET_PWR:
 		ret = nfc_ese_pwr(nfc_dev, ESE_POWER_STATE);
 		break;
+	case NFC_SET_RESET_READ_PENDING:
+		ret = nfc_ioctl_read_pending(nfc_dev, arg);
+		break;
+	case NFC_GET_GPIO_STATUS:
+		ret = nfc_ioctl_get_gpio_status(nfc_dev, arg);
+		break;
 	default:
 		pr_err("%s: bad cmd %lu\n", __func__, arg);
 		ret = -ENOIOCTLCMD;
@@ -344,6 +439,14 @@ int nfc_dev_open(struct inode *inode, struct file *filp)
 	if (nfc_dev->dev_ref_count == 0) {
 		set_valid_gpio(nfc_dev->configs.gpio.dwl_req, 0);
 
+		/*
+		 * A fresh open always starts with a blocking read, the HAL
+		 * may refine this later via NFC_SET_RESET_READ_PENDING.
+		 * This is required because the previous close (or flush)
+		 * left release_read set to release the reader thread.
+		 */
+		nfc_dev->release_read = false;
+		nfc_dev->read_pending = true;
 		nfc_dev->nfc_enable_intr(nfc_dev);
 	}
 	nfc_dev->dev_ref_count = nfc_dev->dev_ref_count + 1;

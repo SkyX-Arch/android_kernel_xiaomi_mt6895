@@ -81,6 +81,8 @@ static bool g_zero_backlight = false;
 		((module == DDP_COMPONENT_CCORR2) ? 2 : 3)))
 
 static bool bypass_color0, bypass_color1;
+/* set once when a negative color matrix offset had to be clamped */
+static bool ccorr_neg_offset_clamped;
 
 static atomic_t g_ccorr_is_clock_on[DISP_CCORR_TOTAL] = {
 	ATOMIC_INIT(0), ATOMIC_INIT(0), ATOMIC_INIT(0), ATOMIC_INIT(0) };
@@ -868,9 +870,33 @@ int disp_ccorr_set_color_matrix(struct mtk_ddp_comp *comp,
 		need_offset = false;
 */
 
-	g_disp_ccorr_coef[id]->offset[0] = (matrix[12] << 1) << ccorr_offset_mask;
-	g_disp_ccorr_coef[id]->offset[1] = (matrix[13] << 1) << ccorr_offset_mask;
-	g_disp_ccorr_coef[id]->offset[2] = (matrix[14] << 1) << ccorr_offset_mask;
+	/*
+	 * The CCORR offset registers take a 26-bit *unsigned* value in which
+	 * 1.0 maps to 0x2000000 (see the "need change offset" path above), so
+	 * the representable range is [0, ~2.0) and negative offsets cannot be
+	 * expressed. The 4x4 matrix coming from SurfaceFlinger/HWC is in Q10
+	 * fixed point, so a negative translation term (e.g. the mid-grey pivot
+	 * of a contrast matrix: (1 - contrast) * 0.5) used to be shifted into
+	 * the unsigned field, wrapped around to ~+2.0 and saturated every
+	 * channel - the panel turned fully white. Clamp to the representable
+	 * range instead so that such matrices only lose their offset instead
+	 * of blanking the screen.
+	 */
+	for (i = 0; i < 3; i++) {
+		int32_t offset = matrix[12 + i];
+
+		if (offset < 0 || offset > ccorr_offset_base * 2 - 1) {
+			if (!ccorr_neg_offset_clamped) {
+				pr_info("%s: clamping color matrix offset[%d] = %d (Q10)\n",
+					__func__, i, offset);
+				ccorr_neg_offset_clamped = true;
+			}
+			offset = (offset < 0) ? 0 : ccorr_offset_base * 2 - 1;
+		}
+
+		g_disp_ccorr_coef[id]->offset[i] =
+			(offset << 1) << ccorr_offset_mask;
+	}
 
 	//if only ccorr0 hw exist and aosp forece linear or
 	//pq force nonlinear,id should be 0, g_disp_ccorr_coef

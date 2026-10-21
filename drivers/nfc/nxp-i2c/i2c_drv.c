@@ -60,7 +60,12 @@ static void print_buffer(struct nfc_dev *nfc_dev, unsigned char *buf, int len, b
 	if(send == true)
 		dir = '>';
 
-    dev_warn(&nfc_dev->i2c_dev.client->dev, "%3d %c %s\n", len, dir, output);
+    /*
+     * Keep the NCI dump at debug level: the NFCC sends a proprietary
+     * "61 21 00" notification on every polling loop (~0.7s), dumping it
+     * as a warning floods the kernel log permanently.
+     */
+    dev_dbg(&nfc_dev->i2c_dev.client->dev, "%3d %c %s\n", len, dir, output);
 }
 
 /**
@@ -130,6 +135,12 @@ int i2c_read(struct nfc_dev *nfc_dev, char *buf, size_t count, int timeout)
 
 	pr_debug("%s: reading %zu bytes.\n", __func__, count);
 
+	/* HAL does not wait for any data (device is going down) */
+	if (nfc_dev->release_read || !nfc_dev->read_pending) {
+		pr_debug("%s: read released\n", __func__);
+		return 0;
+	}
+
 	if (timeout > NCI_CMD_RSP_TIMEOUT_MS)
 		timeout = NCI_CMD_RSP_TIMEOUT_MS;
 
@@ -147,7 +158,9 @@ int i2c_read(struct nfc_dev *nfc_dev, char *buf, size_t count, int timeout)
 				if (timeout) {
 					ret = wait_event_interruptible_timeout(
 						nfc_dev->read_wq,
-						(!i2c_dev->irq_enabled||nfc_dev->release_read),
+						(!i2c_dev->irq_enabled ||
+						 nfc_dev->release_read ||
+						 !nfc_dev->read_pending),
 						msecs_to_jiffies(timeout));
 					if (ret <= 0) {
 						pr_err("%s: timeout error\n", __func__);
@@ -156,7 +169,9 @@ int i2c_read(struct nfc_dev *nfc_dev, char *buf, size_t count, int timeout)
 				} else {
 					ret = wait_event_interruptible(
 						nfc_dev->read_wq,
-						(!i2c_dev->irq_enabled||nfc_dev->release_read));
+						(!i2c_dev->irq_enabled ||
+						 nfc_dev->release_read ||
+						 !nfc_dev->read_pending));
 					if (ret) {
 						pr_err("%s: err wakeup of wq\n", __func__);
 						goto err;
@@ -288,7 +303,8 @@ ssize_t nfc_i2c_dev_read(struct file *filp, char __user *buf, size_t count,
 		}
 	}
 	mutex_unlock(&nfc_dev->read_mutex);
-	print_buffer(nfc_dev, nfc_dev->read_kbuf, ret, false);
+	if (ret > 0)
+		print_buffer(nfc_dev, nfc_dev->read_kbuf, ret, false);
 	return ret;
 }
 
@@ -362,6 +378,10 @@ int nfc_i2c_dev_probe(struct i2c_client *client, const struct i2c_device_id *id)
 	}
 	nfc_dev->interface = PLATFORM_IF_I2C;
 	nfc_dev->nfc_state = NFC_STATE_NCI;
+	/* wait for the NFCC interrupt by default, the HAL refines this
+	 * through NFC_SET_RESET_READ_PENDING during open/shutdown
+	 */
+	nfc_dev->read_pending = true;
 	nfc_dev->i2c_dev.client = client;
 	i2c_dev = &nfc_dev->i2c_dev;
 	nfc_dev->nfc_read = i2c_read;
