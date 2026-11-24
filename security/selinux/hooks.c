@@ -105,10 +105,6 @@
 #include "avc_ss.h"
 
 struct selinux_state selinux_state;
-#ifdef CONFIG_KSU_SUSFS
-extern struct selinux_state fake_state;
-extern bool ksu_selinux_hide_running __read_mostly;
-#endif // #ifdef CONFIG_KSU_SUSFS
 
 /* SECMARK reference count */
 static atomic_t selinux_secmark_refcount = ATOMIC_INIT(0);
@@ -712,11 +708,11 @@ static int selinux_set_mnt_opts(struct super_block *sb,
 	    !strcmp(sb->s_type->name, "tracefs") ||
 	    !strcmp(sb->s_type->name, "binder") ||
 	    !strcmp(sb->s_type->name, "bpf") ||
-            !strcmp(sb->s_type->name, "pstore") ||
-            !strcmp(sb->s_type->name, "securityfs") ||
-            // Android: remove functionfs policycap check due to
-            // ABI breakage with policycap array.
-            !strcmp(sb->s_type->name, "functionfs"))
+	    !strcmp(sb->s_type->name, "pstore") ||
+	    !strcmp(sb->s_type->name, "securityfs") ||
+	    // Android: remove functionfs policycap check due to
+	    // ABI breakage with policycap array.
+	    !strcmp(sb->s_type->name, "functionfs"))
 		sbsec->flags |= SE_SBGENFS;
 
 	if (!strcmp(sb->s_type->name, "sysfs") ||
@@ -1342,16 +1338,21 @@ static int inode_doinit_use_xattr(struct inode *inode, struct dentry *dentry,
 				  u32 def_sid, u32 *sid)
 {
 #define INITCONTEXTLEN 255
-	char context_onstack[INITCONTEXTLEN + 1] __aligned(sizeof(long));
-	char *context = context_onstack;
+	char *context;
 	unsigned int len;
 	int rc;
 
 	len = INITCONTEXTLEN;
+	context = kmalloc(len + 1, GFP_NOFS);
+	if (!context)
+		return -ENOMEM;
+
 	context[len] = '\0';
 	rc = __vfs_getxattr(dentry, inode, XATTR_NAME_SELINUX, context, len,
 			    XATTR_NOSECURITY);
 	if (rc == -ERANGE) {
+		kfree(context);
+
 		/* Need a larger buffer.  Query for the right size. */
 		rc = __vfs_getxattr(dentry, inode, XATTR_NAME_SELINUX, NULL, 0,
 				    XATTR_NOSECURITY);
@@ -1368,8 +1369,7 @@ static int inode_doinit_use_xattr(struct inode *inode, struct dentry *dentry,
 				    context, len, XATTR_NOSECURITY);
 	}
 	if (rc < 0) {
-		if (context != context_onstack)
-			kfree(context);
+		kfree(context);
 		if (rc != -ENODATA) {
 			pr_warn("SELinux: %s:  getxattr returned %d for dev=%s ino=%ld\n",
 				__func__, -rc, inode->i_sb->s_id, inode->i_ino);
@@ -1393,8 +1393,7 @@ static int inode_doinit_use_xattr(struct inode *inode, struct dentry *dentry,
 				__func__, context, -rc, dev, ino);
 		}
 	}
-	if (context != context_onstack)
-		kfree(context);
+	kfree(context);
 	return 0;
 }
 
@@ -5242,15 +5241,17 @@ out:
 
 static int selinux_sk_alloc_security(struct sock *sk, int family, gfp_t priority)
 {
-	struct sk_security_struct *sksec = sk->sk_security;
+	struct sk_security_struct *sksec;
 
-#ifdef CONFIG_NETLABEL
-	memset(sksec, 0, offsetof(struct sk_security_struct, sid));
-#endif
+	sksec = kzalloc(sizeof(*sksec), priority);
+	if (!sksec)
+		return -ENOMEM;
+
 	sksec->peer_sid = SECINITSID_UNLABELED;
 	sksec->sid = SECINITSID_UNLABELED;
 	sksec->sclass = SECCLASS_SOCKET;
 	selinux_netlbl_sk_security_reset(sksec);
+	sk->sk_security = sksec;
 
 	return 0;
 }
@@ -5259,12 +5260,14 @@ static void selinux_sk_free_security(struct sock *sk)
 {
 	struct sk_security_struct *sksec = sk->sk_security;
 
+	sk->sk_security = NULL;
 	selinux_netlbl_sk_security_free(sksec);
+	kfree(sksec);
 }
 
 static void selinux_sk_clone_security(const struct sock *sk, struct sock *newsk)
 {
-	const struct sk_security_struct *sksec = sk->sk_security;
+	struct sk_security_struct *sksec = sk->sk_security;
 	struct sk_security_struct *newsksec = newsk->sk_security;
 
 	newsksec->sid = sksec->sid;
@@ -5473,7 +5476,7 @@ static void selinux_sctp_sk_clone(struct sctp_endpoint *ep, struct sock *sk,
 static int selinux_inet_conn_request(struct sock *sk, struct sk_buff *skb,
 				     struct request_sock *req)
 {
-	const struct sk_security_struct *sksec = sk->sk_security;
+	struct sk_security_struct *sksec = sk->sk_security;
 	int err;
 	u16 family = req->rsk_ops->family;
 	u32 connsid;
@@ -6586,43 +6589,6 @@ abort_change:
 	return error;
 }
 
-#ifdef CONFIG_KSU_SUSFS
-static int my_setprocattr(const char *name, void *value, size_t size)
-{
-	u32 mysid = current_sid(), sid = 0;
-	int error;
-	char *str = value;
-
-	// apply to all app uids
-	if (likely(current_uid().val < 10000 ||
-				!ksu_selinux_hide_running ||
-				strcmp(name, "current")))
-		return selinux_setprocattr(name, value, size);
-
-	error = avc_has_perm(&selinux_state,
-				     mysid, mysid, SECCLASS_PROCESS,
-				     PROCESS__SETCURRENT, NULL);
-
-	if (error)
-		return error;
-
-	/* Obtain a SID for the context, if one was specified. */
-	if (size && str[0] && str[0] != '\n') {
-		if (str[size-1] == '\n') {
-			str[size-1] = 0;
-			size--;
-		}
-
-		error = security_context_to_sid(&fake_state, value, size,
-						&sid, GFP_KERNEL);
-		if (error)
-			return error;
-	}
-
-	return selinux_setprocattr(name, value, size);
-}
-#endif // #ifdef CONFIG_KSU_SUSFS
-
 static int selinux_ismaclabel(const char *name)
 {
 	return (strcmp(name, XATTR_SELINUX_SUFFIX) == 0);
@@ -7204,11 +7170,7 @@ static struct security_hook_list selinux_hooks[] __lsm_ro_after_init = {
 	LSM_HOOK_INIT(d_instantiate, selinux_d_instantiate),
 
 	LSM_HOOK_INIT(getprocattr, selinux_getprocattr),
-#ifdef CONFIG_KSU_SUSFS
-	LSM_HOOK_INIT(setprocattr, my_setprocattr),
-#else
 	LSM_HOOK_INIT(setprocattr, selinux_setprocattr),
-#endif // #ifdef CONFIG_KSU_SUSFS
 
 	LSM_HOOK_INIT(ismaclabel, selinux_ismaclabel),
 	LSM_HOOK_INIT(secctx_to_secid, selinux_secctx_to_secid),
